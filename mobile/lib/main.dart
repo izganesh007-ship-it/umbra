@@ -35,6 +35,7 @@ import 'screens/chat_screen_new.dart' as chat_new;
 import 'screens/home_screen.dart';
 import 'screens/new_group_screen_new.dart';
 import 'screens/room_create_sheet.dart';
+import 'screens/room_link_sheet.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'screens/group_chat_screen_new.dart';
 import 'screens/chat_screen.dart';
@@ -8411,7 +8412,23 @@ class _RootShellState extends State<RootShell> {
         ),
       );
     }
-    return const ChatListScreen();
+    return ChatListScreen(
+      haloId: appState.myHandle,
+      contacts: appState.contacts,
+      groups: appState.groups,
+      pendingCount: appState.pendingCount,
+      onAddContact: () => showAddContact(context),
+      onNewGroup: () => Navigator.push(context, haloRoute(const NewGroupScreen())),
+      onNewRoom: () => _createNewRoom(context),
+      expiredRoomName: appState.expiredRoomName,
+      onOpenSettings: () => Navigator.push(context, haloRoute(const SettingsScreen())),
+      onOpenChat: (peerHaloId, {peerOnion, peerXPub, avatarSeed, avatarChoice}) =>
+          openChatForHalo(peerHaloId),
+      onOpenGroup: (groupId) => Navigator.push(
+        context,
+        haloRoute(GroupChatScreen(groupId: groupId)),
+      ),
+    );
   }
 }
 
@@ -8595,6 +8612,96 @@ Future<void> showAddContact(BuildContext context) async {
   await appState.refreshContacts();
   if (!context.mounted) return;
   showHaloToast(context, status);
+}
+
+Future<void> _createNewRoom(BuildContext context) async {
+  final name = await showHaloSheet<String>(
+    context,
+    builder: (ctx) => _NewRoomSheet(),
+  );
+  if (name == null || name.isEmpty || !context.mounted) return;
+  final roomId = await appState.createRoom(name);
+  if (!context.mounted) return;
+  final link = await appState.roomLinkFor(roomId);
+  if (link != null && context.mounted) {
+    await showRoomLinkSheet(context, link);
+  }
+}
+
+class _NewRoomSheet extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    final colors = UmbraTheme.colorsOf(context);
+    final ctrl = TextEditingController();
+    return Padding(
+      padding: EdgeInsets.fromLTRB(
+        22,
+        0,
+        22,
+        24 + MediaQuery.of(context).viewInsets.bottom,
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const SheetHandle(),
+          const SizedBox(height: 18),
+          Text(
+            'New Room',
+            style: TextStyle(
+              fontFamily: UmbraTypography.fontSerif,
+              fontSize: 22,
+              fontWeight: FontWeight.w400,
+              color: colors.textPrimary,
+              fontStyle: FontStyle.italic,
+              height: 1.05,
+              letterSpacing: -0.015,
+            ),
+          ),
+          const SizedBox(height: 16),
+          TextField(
+            controller: ctrl,
+            autofocus: true,
+            maxLength: 50,
+            style: TextStyle(
+              fontFamily: UmbraTypography.fontSans,
+              fontSize: 16,
+              color: colors.textPrimary,
+            ),
+            decoration: InputDecoration(
+              hintText: 'Room name',
+              hintStyle: TextStyle(
+                fontFamily: UmbraTypography.fontSans,
+                fontSize: 16,
+                color: colors.textMuted,
+              ),
+              border: InputBorder.none,
+            ),
+            onSubmitted: (v) => Navigator.pop(context, v.trim()),
+          ),
+          const SizedBox(height: 16),
+          Row(
+            children: [
+              Expanded(
+                child: TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: Text('Cancel'),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: FilledButton(
+                  onPressed: () => Navigator.pop(context, ctrl.text.trim()),
+                  child: Text('Create'),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+        ],
+      ),
+    );
+  }
 }
 
 class _Pressable extends StatefulWidget {
