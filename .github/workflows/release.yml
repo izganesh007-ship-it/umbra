@@ -51,9 +51,9 @@ jobs:
         working-directory: engine
         run: ./build.sh
 
-      - name: Get dependencies (offline)
+      - name: Get dependencies
         working-directory: mobile
-        run: flutter pub get --offline
+        run: flutter pub get
 
       - name: Configure signing
         if: env.KEYSTORE_BASE64 != ''

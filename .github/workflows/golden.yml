@@ -41,9 +41,9 @@ jobs:
           ndk-version: r28c
           cmdline-tools-version: latest
 
-      - name: Get dependencies (offline)
+      - name: Get dependencies
         working-directory: mobile
-        run: flutter pub get --offline
+        run: flutter pub get
 
       - name: Run golden tests
         working-directory: mobile
