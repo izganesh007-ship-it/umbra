@@ -1,0 +1,30 @@
+﻿import 'package:flutter_test/flutter_test.dart';
+import 'package:umbra/vouch_text.dart';
+
+void main() {
+  test('words one, two and many vouchers', () {
+    expect(vouchedByLine(['alice']), 'Vouched by alice');
+    expect(vouchedByLine(['alice', 'bob']), 'Vouched by alice and bob');
+    expect(
+      vouchedByLine(['alice', 'bob', 'cat']),
+      'Vouched by alice, bob and 1 other you know',
+    );
+    expect(
+      introducedByLine(['alice', 'bob', 'cat', 'dan']),
+      'Introduced by alice, bob and 2 others you know',
+    );
+  });
+
+  test('nobody gives an empty line', () {
+    expect(vouchedByLine([]), '');
+    expect(introducedByLine([]), '');
+  });
+
+  test('share warning names both', () {
+    expect(
+      shareWarning('alice', 'bob'),
+      "This shares alice's address with bob",
+    );
+  });
+}
+

@@ -1,0 +1,7 @@
+The wipe now really wipes, through Android's own clear-data call. The app lock covers every screen, and screenshots no longer ask for the pin.
+
+Five wrong pins hold the pad, longer each time. Request notifications no longer show a stranger's words. Edits queue and retry. Accept, decline and block on the requests list.
+
+A message to someone who has not added you back no longer shows a false tick. Stalled photos resume from the missing piece. Photos and files send faster.
+
+Many smaller fixes, and sentence case throughout.

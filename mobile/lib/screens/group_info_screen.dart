@@ -1,0 +1,582 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// group info: name and member changes for the admin, leave for everyone
+
+import 'dart:io';
+import 'package:flutter/material.dart';
+import '../main.dart' show appState, db;
+import '../atmosphere.dart' show Atmo, atmoFromName;
+import '../theme/theme.dart';
+import '../widgets/kryfo_avatar.dart';
+import '../rooms.dart';
+import 'room_link_sheet.dart';
+import '../widgets/motion.dart' show haloRoute;
+import 'package:flutter/services.dart';
+import 'chat_screen.dart' show MediaGalleryScreen, atmoFromName;
+import 'wallpaper_sheet.dart';
+import '../widgets/stagger_in.dart';
+import '../widgets/sheet_handle.dart';
+import '../widgets/halo_sheet.dart';
+import '../widgets/confirm_sheet.dart';
+import '../l10n/l10n.dart';
+import '../l10n/numbers.dart';
+
+class GroupInfoScreen extends StatefulWidget {
+  final String groupId;
+  const GroupInfoScreen({super.key, required this.groupId});
+  @override
+  State<GroupInfoScreen> createState() => _GroupInfoScreenState();
+}
+
+class _GroupInfoScreenState extends State<GroupInfoScreen> {
+  String _name = '';
+  bool _isAdmin = false;
+  // room fields, null for a plain group
+  String? _roomPub;
+  bool get _isRoom => _roomPub != null;
+  List<String> _members = [];
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final g = await db.getGroup(widget.groupId);
+    final members = await db.getGroupMembers(widget.groupId);
+    if (!mounted) return;
+    setState(() {
+      _name = (g?['name'] as String?) ?? l10n.groupInfoGroup;
+      _isAdmin = ((g?['is_admin'] as int?) ?? 0) == 1;
+      _roomPub = g?['room_pub'] as String?;
+      _members = members;
+      _loading = false;
+    });
+  }
+
+  Future<void> _rename() async {
+    final newName = (await showInputSheet(
+      context,
+      title: l10n.groupInfoRenameGroup,
+      initial: _name,
+      save: l10n.groupInfoRename,
+    ))?.trim();
+    if (newName != null && newName.isNotEmpty && newName != _name) {
+      await appState.renameGroupAndAnnounce(widget.groupId, newName);
+      await _load();
+    }
+  }
+
+  Future<void> _addMembers() async {
+    final available = appState.contacts
+        .where((c) => !_members.contains(c.haloId))
+        .toList();
+    if (available.isEmpty) {
+      showHaloToast(context, l10n.groupInfoNoContactsToAdd);
+      return;
+    }
+    final picked = await showHaloSheet<Set<String>>(
+      context,
+      scroll: true,
+      builder: (c) => _AddMemberSheet(available: available),
+    );
+    if (picked != null && picked.isNotEmpty) {
+      try {
+        await appState.addMembersToGroup(widget.groupId, picked.toList());
+      } catch (e) {
+        // group full toast
+        if (mounted) {
+          showHaloToast(
+            context,
+            e is StateError ? e.message : l10n.groupInfoCouldNotAdd,
+          );
+        }
+        return;
+      }
+      await _load();
+    }
+  }
+
+  Future<void> _confirmRemove(String haloId) async {
+    final ok = await showConfirmSheet(
+      context,
+      title: l10n.groupInfoRemove(haloId),
+      line: l10n.groupInfoTheyWillStopReceiving,
+      yes: l10n.commonRemove,
+    );
+    if (ok == true) {
+      await appState.removeMembersFromGroup(widget.groupId, [haloId]);
+      await _load();
+    }
+  }
+
+  Future<void> _pickAtmosphere() async {
+    final current = atmoFromName(await db.getGroupAtmosphere(widget.groupId));
+    if (!mounted) return;
+    final picked = await showWallpaperSheet(context, current);
+    if (picked is! Atmo) return;
+    HapticFeedback.selectionClick();
+    await db.setGroupAtmosphere(widget.groupId, picked.name);
+  }
+
+  Future<void> _openSharedMedia() async {
+    final rows = await db.loadGroupMessages(widget.groupId);
+    final paths = <String>[];
+    for (final r in rows) {
+      final mp = r['media_path'] as String?;
+      if (mp != null && mp.isNotEmpty && await File(mp).exists()) {
+        paths.add(mp);
+      }
+    }
+    if (!mounted) return;
+    Navigator.of(context).push(
+      haloRoute(
+        MediaGalleryScreen(paths: paths.reversed.toList(), title: _name),
+      ),
+    );
+  }
+
+  Future<void> _confirmClear() async {
+    final ok = await showConfirmSheet(
+      context,
+      title: l10n.groupInfoClearThisConversation,
+      line: l10n.groupInfoEveryMessageHereIs,
+      yes: l10n.groupInfoClear,
+    );
+    if (ok == true) {
+      await db.clearGroupConversation(widget.groupId);
+      if (!mounted) return;
+      showHaloToast(context, l10n.groupInfoConversationCleared);
+    }
+  }
+
+  Future<void> _confirmLeave() async {
+    final ok = await showConfirmSheet(
+      context,
+      title: _isRoom ? l10n.groupInfoLeaveRoom : l10n.groupInfoLeaveGroup,
+      line: _isRoom
+          ? l10n.groupInfoEverythingInItIs
+          : l10n.groupInfoYouWillStopReceiving,
+      yes: l10n.groupInfoLeave,
+    );
+    if (ok == true) {
+      await appState.leaveGroupAndAnnounce(widget.groupId);
+      if (!mounted) return;
+      // pop info + chat in one go
+      Navigator.of(context).pop();
+      Navigator.of(context).pop();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+  final colors = UmbraTheme.colorsOf(context);
+
+    if (_loading) {
+      return Scaffold(
+        backgroundColor: colors.surface,
+        body: Center(child: CircularProgressIndicator(color: colors.accent)),
+      );
+    }
+    final myId = appState.myId;
+    return Scaffold(
+      backgroundColor: colors.surface,
+      body: SafeArea(
+        child: Column(
+          children: [
+            // header
+            Padding(
+              padding: const EdgeInsetsDirectional.fromSTEB(4, 6, 12, 6),
+              child: Row(
+                children: [
+                  IconButton(
+                    tooltip: l10n.commonBack,
+                    icon: Icon(
+                      Icons.chevron_left,
+                      color: colors.textPrimary,
+                      size: 26,
+                    ),
+                    onPressed: () => Navigator.of(context).pop(),
+                  ),
+                  Expanded(
+                    child: Text(
+                      l10n.groupInfoGroupInfo,
+                      style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 18, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 8),
+            // big group identity
+            Center(
+              child: Column(
+                children: [
+                  Container(
+                    width: 72,
+                    height: 72,
+                    decoration: BoxDecoration(
+                      color: colors.accentSoft,
+                      borderRadius: BorderRadius.circular(18),
+                      border: Border.all(
+                        color: colors.accent.withValues(alpha: 0.45),
+                        width: 0.8,
+                      ),
+                    ),
+                    alignment: Alignment.center,
+                    child: Text(
+                      _name.isEmpty
+                          ? '·'
+                          : _name.characters.first.toUpperCase(),
+                      style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 36, fontWeight: FontWeight.w400, color: colors.accent, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  GestureDetector(
+                    onTap: _isAdmin && !_isRoom ? _rename : null,
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          _name,
+                          style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 22, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+                        ),
+                        if (_isAdmin && !_isRoom) ...[
+                          const SizedBox(width: 6),
+                          Icon(
+                            Icons.edit_outlined,
+                            size: 16,
+                            color: colors.textTertiary,
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    l10n.groupInfo1Member(_members.length),
+                    style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.1),
+                  ),
+                  if (_isAdmin) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      l10n.groupInfoAdmin,
+                      style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: colors.accent, letterSpacing: 0.4),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            const SizedBox(height: 24),
+            // members header + add button
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
+              child: Row(
+                children: [
+                  Text(
+                    l10n.groupInfoMembers2,
+                    style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.14),
+                  ),
+                  const Spacer(),
+                  if (_isRoom)
+                    GestureDetector(
+                      onTap: () async {
+                        final link = await appState.roomLinkFor(widget.groupId);
+                        if (link != null && context.mounted) {
+                          await showRoomLinkSheet(context, link);
+                        }
+                      },
+                      behavior: HitTestBehavior.opaque,
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.qr_code_2_outlined,
+                            size: 14,
+                            color: colors.accent,
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            l10n.groupInfoInvite,
+                            style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: colors.accent, letterSpacing: 0.14),
+                          ),
+                        ],
+                      ),
+                    ),
+                  if (_isAdmin && !_isRoom)
+                    GestureDetector(
+                      onTap: _addMembers,
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.add_rounded,
+                            size: 14,
+                            color: colors.accent,
+                          ),
+                          const SizedBox(width: 3),
+                          Text(
+                            l10n.commonAdd,
+                            style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: colors.accent, letterSpacing: 0.14),
+                          ),
+                        ],
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            Expanded(
+              child: ListView.builder(
+                itemCount: _members.length,
+                itemBuilder: (_, i) {
+                  final m = _members[i];
+                  final isMe = m == myId || (_isRoom && m == _roomPub);
+                  return StaggerIn(
+                    index: i,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 8,
+                      ),
+                      child: Row(
+                        children: [
+                          KryfoAvatar(seed: m, size: 36),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  looksLikeRoomKey(m) ? roomTag(m) : m,
+                                  style: looksLikeRoomKey(m)
+                                      ? TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 13, fontWeight: FontWeight.w500, color: colors.textPrimary, letterSpacing: 0.12)
+                                      : TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w500, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+                                ),
+                                if (isMe)
+                                  Text(
+                                    l10n.groupInfoYou,
+                                    style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: colors.accent, letterSpacing: 0.3),
+                                  ),
+                              ],
+                            ),
+                          ),
+                          if (_isAdmin && !isMe)
+                            IconButton(
+                              tooltip: l10n.groupInfoRemoveFromGroup,
+                              icon: Icon(
+                                Icons.remove_circle_outline,
+                                size: 18,
+                                color: colors.textTertiary,
+                              ),
+                              onPressed: () => _confirmRemove(m),
+                            ),
+                        ],
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+              child: GestureDetector(
+                onTap: _pickAtmosphere,
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  decoration: BoxDecoration(
+                    color: colors.surfaceElevated,
+                    borderRadius: BorderRadius.circular(UmbraRadius.lg),
+                  ),
+                  alignment: Alignment.center,
+                  child: Text(
+                    l10n.groupInfoWallpaper,
+                    style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w500, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+                  ),
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+              child: GestureDetector(
+                onTap: _openSharedMedia,
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  decoration: BoxDecoration(
+                    color: colors.surfaceElevated,
+                    borderRadius: BorderRadius.circular(UmbraRadius.lg),
+                  ),
+                  alignment: Alignment.center,
+                  child: Text(
+                    l10n.groupInfoSharedMedia,
+                    style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w500, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+                  ),
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+              child: GestureDetector(
+                onTap: _confirmClear,
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  decoration: BoxDecoration(
+                    color: colors.surfaceElevated,
+                    borderRadius: BorderRadius.circular(UmbraRadius.lg),
+                  ),
+                  alignment: Alignment.center,
+                  child: Text(
+                    l10n.groupInfoClearConversation,
+                    style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w500, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+                  ),
+                ),
+              ),
+            ),
+            // leave (everyone)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+              child: GestureDetector(
+                onTap: _confirmLeave,
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  decoration: BoxDecoration(
+                    color: colors.surfaceElevated,
+                    borderRadius: BorderRadius.circular(UmbraRadius.lg),
+                    border: Border.all(
+                      color: colors.error.withValues(alpha: 0.4),
+                      width: 0.6,
+                    ),
+                  ),
+                  alignment: Alignment.center,
+                  child: Text(
+                    _isRoom
+                        ? l10n.groupInfoLeaveRoom2
+                        : l10n.groupInfoLeaveGroup2,
+                    style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w500, color: colors.error, height: 1.5, letterSpacing: 0),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _AddMemberSheet extends StatefulWidget {
+  final List available;
+  const _AddMemberSheet({required this.available});
+  @override
+  State<_AddMemberSheet> createState() => _AddMemberSheetState();
+}
+
+class _AddMemberSheetState extends State<_AddMemberSheet> {
+  final Set<String> _picked = {};
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return SafeArea(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SheetHandle(),
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              const SizedBox(width: 20),
+              Text(
+                l10n.groupInfoAddMembers,
+                style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 16, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+              ),
+              const Spacer(),
+              TextButton(
+                onPressed: _picked.isEmpty
+                    ? null
+                    : () => Navigator.pop(context, _picked),
+                child: Text(
+                  l10n.groupInfoAdd(whole(_picked.length)),
+                  style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: _picked.isEmpty
+                        ? colors.textTertiary
+                        : colors.accent, height: 1.5, letterSpacing: 0),
+                ),
+              ),
+              const SizedBox(width: 8),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Flexible(
+            child: ListView.builder(
+              shrinkWrap: true,
+              itemCount: widget.available.length,
+              itemBuilder: (_, i) {
+                final c = widget.available[i];
+                final picked = _picked.contains(c.haloId);
+                return InkWell(
+                  onTap: () => setState(() {
+                    if (picked) {
+                      _picked.remove(c.haloId);
+                    } else {
+                      _picked.add(c.haloId);
+                    }
+                  }),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 20,
+                      vertical: 10,
+                    ),
+                    child: Row(
+                      children: [
+                        KryfoAvatar(seed: c.avatarSeed, size: 32),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            c.haloId,
+                            style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w500, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+                          ),
+                        ),
+                        AnimatedContainer(
+                          duration: const Duration(milliseconds: 120),
+                          width: 20,
+                          height: 20,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: picked
+                                ? colors.accent
+                                : Colors.transparent,
+                            border: Border.all(
+                              color: picked
+                                  ? colors.accent
+                                  : colors.separatorStrong,
+                              width: 1.2,
+                            ),
+                          ),
+                          alignment: Alignment.center,
+                          child: picked
+                              ? Icon(
+                                  Icons.check_rounded,
+                                  size: 12,
+                                  color: colors.accentOn,
+                                )
+                              : null,
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+          const SizedBox(height: 12),
+        ],
+      ),
+    );
+  }
+}

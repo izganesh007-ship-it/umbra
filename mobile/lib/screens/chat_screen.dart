@@ -1,0 +1,7789 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// chat screen: bubbles, composer, live receive over tor.
+
+import '../lock_state.dart';
+import 'dart:typed_data';
+import 'dart:async';
+import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:file_picker/file_picker.dart';
+import '../picked.dart';
+import 'package:share_plus/share_plus.dart';
+import 'package:record/record.dart';
+import 'dart:io';
+import 'dart:convert';
+import 'key_verification_screen.dart';
+import 'contact_screen.dart';
+import 'wallpaper_sheet.dart';
+import 'introduce_sheet.dart';
+import 'shield_sheet.dart';
+import '../vouch_text.dart';
+import '../widgets/intro_chip.dart';
+import '../widgets/media_bubbles.dart' show VoiceBubble;
+import '../widgets/confirm_sheet.dart';
+import '../widgets/pins.dart';
+import '../widgets/remembered_height.dart';
+import '../widgets/row_anchor.dart';
+import '../widgets/video_bubble.dart';
+import '../widgets/kryfo_link_text.dart';
+import '../open_file.dart';
+import '../widgets/notice_banner.dart';
+import '../widgets/swipe_to_reply.dart';
+import '../signal_session.dart';
+import '../message_envelope.dart'
+    show wrapMessage, powBusy, SenderInfo, ReactionFrame, grindPow, powBits;
+import '../theme/theme.dart';
+import '../theme.dart' show HaloType;
+import '../media_progress.dart';
+import '../media_send.dart'
+    show sendChunkedMediaTo, cancelMediaSend, mediaInflight;
+import '../image_strip.dart';
+import '../mp4_strip.dart';
+import '../widgets/pow_note.dart';
+import '../widgets/decode_px.dart';
+import '../notifications.dart' show clearNotificationsFor;
+import '../widgets/kryfo_avatar.dart';
+import '../main.dart'
+    show
+        engine,
+        db,
+        signalEncrypt,
+        signalEncryptSerial,
+        hasSessionWith,
+        appState,
+        currentChatPeer,
+        shredFile,
+        torStrictGetOnIsolate,
+        TorHalo;
+import '../widgets/press_scale.dart';
+import '../widgets/stagger_in.dart';
+import '../widgets/motion.dart';
+import '../widgets/burn_fade.dart';
+import '../dlog.dart';
+import '../widgets/sheet_handle.dart';
+import '../widgets/menu_backdrop.dart';
+import '../widgets/link_stub.dart';
+import '../widgets/preview_strip.dart';
+import 'camera_screen.dart';
+import '../link_preview.dart' show titleFromHtml, firstUrl, senderPreview;
+export '../link_preview.dart' show firstUrl;
+export '../atmosphere.dart'
+    show
+        Atmo,
+        atmoFromName,
+        atmoAccent,
+        atmoLabel,
+        atmoIsPattern,
+        PatternPainter,
+        AtmosphereWash;
+import '../atmosphere.dart';
+import '../widgets/halo_sheet.dart';
+import '../widgets/moved_strip.dart';
+import '../l10n/l10n.dart';
+import '../l10n/dates.dart';
+import '../l10n/marked.dart';
+import '../l10n/numbers.dart';
+import '../widgets/video_viewer.dart';
+import '../bidi_safe.dart';
+import '../lock_guard.dart' show lockGuard;
+
+// unsent drafts per peer, so text survives leaving a chat
+final Map<String, String> _draftPerPeer = {};
+// newest message ms seen when the chat was last left, per peer.
+final Map<String, int> _lastReadPerPeer = {};
+
+class ChatScreen extends StatefulWidget {
+  final String peerHaloId;
+  final String peerOnion;
+  final String peerXPub;
+  final String avatarSeed;
+  // the face they picked, handed over so the hero never lands on the
+  // letter fallback while the row is still loading
+  final int? avatarChoice;
+  final String? initialText;
+  final String? jumpToUid;
+
+  const ChatScreen({
+    super.key,
+    required this.peerHaloId,
+    required this.peerOnion,
+    required this.peerXPub,
+    required this.avatarSeed,
+    this.avatarChoice,
+    this.initialText,
+    this.jumpToUid,
+  });
+
+  @override
+  State<ChatScreen> createState() => _ChatScreenState();
+}
+
+class _Msg {
+  final String direction;
+  String text;
+  final DateTime when;
+  int? burnAt;
+  int? burnSecs; // intended burn window; lit into burnAt on delivery.
+  String? msgUid;
+  // msg_uid of the message this one replies to, or null.
+  final String? replyTo;
+  // sender asked that this not be screenshotted
+  final bool secure;
+  bool sending;
+  bool failed = false;
+  // online, a failed row retries itself and reads as pending. past the cap
+  // it shows as failed and the tap is the only way on.
+  int autoRetries = 0;
+  bool gaveUp = false;
+  // stored at an address they do not read yet: not sent, not failed. the
+  // outbox keeps trying routes that reach them until they add us back.
+  bool parked = false;
+  bool delivered;
+  bool edited;
+  bool pinned;
+  bool removing = false;
+  String? mediaPath;
+  String? filePath;
+  String? fileName;
+  bool voiceDisguised;
+  bool saved;
+  Map<String, String> reactions;
+  bool fresh = false;
+  int rowid = 0; // db insertion order, for append tracking
+  Map<String, String>? preview; // link preview card, decoded from stored json
+  _Msg(
+    this.direction,
+    this.text,
+    this.when, {
+    this.burnAt,
+    this.burnSecs,
+    this.msgUid,
+    this.replyTo,
+    this.secure = false,
+    this.sending = false,
+    this.edited = false,
+    this.pinned = false,
+    this.mediaPath,
+    this.filePath,
+    this.fileName,
+    this.voiceDisguised = false,
+    this.saved = false,
+    this.delivered = false,
+    Map<String, String>? reactions,
+  }) : reactions = reactions ?? <String, String>{};
+}
+
+String _humanSize(int bytes) {
+  if (bytes < 1024) return l10n.chatB(whole(bytes));
+  if (bytes < 1024 * 1024) {
+    return l10n.chatKb(whole(((bytes / 1024)).round()));
+  }
+  return l10n.chatMb(decimal((bytes / (1024 * 1024)), 1));
+}
+
+IconData _fileGlyph(String name) {
+  final n = name.toLowerCase();
+  if (n.endsWith('.pdf')) return Icons.picture_as_pdf_outlined;
+  if (n.endsWith('.zip') || n.endsWith('.rar') || n.endsWith('.7z')) {
+    return Icons.folder_zip_outlined;
+  }
+  if (n.endsWith('.doc') || n.endsWith('.docx') || n.endsWith('.txt')) {
+    return Icons.description_outlined;
+  }
+  if (n.endsWith('.mp3') || n.endsWith('.wav') || n.endsWith('.m4a')) {
+    return Icons.audiotrack_outlined;
+  }
+  if (n.endsWith('.mp4') || n.endsWith('.mov') || n.endsWith('.mkv')) {
+    return Icons.movie_outlined;
+  }
+  return Icons.insert_drive_file_outlined;
+}
+
+Widget _fileCard(_Msg msg, bool isOut) {
+  final fg = isOut ? colors.accentOn : colors.textPrimary;
+  final sub = isOut ? colors.accentOn : colors.textTertiary;
+  final icon = isOut ? colors.accentOn : colors.accent;
+  int? sz;
+  try {
+    if (msg.filePath != null) sz = File(msg.filePath!).lengthSync();
+  } catch (_) {}
+  final ext = (msg.fileName ?? '').contains('.')
+      ? msg.fileName!.split('.').last.toUpperCase()
+      : l10n.chatFile;
+  return Container(
+    constraints: const BoxConstraints(maxWidth: 230),
+    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+    decoration: BoxDecoration(
+      color: isOut
+          ? colors.accentOn.withValues(alpha: 0.12)
+          : colors.surfaceHover,
+      borderRadius: BorderRadius.circular(UmbraRadius.lg),
+    ),
+    child: Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 38,
+          height: 38,
+          decoration: BoxDecoration(
+            color: isOut
+                ? colors.accentOn.withValues(alpha: 0.16)
+                : colors.accentSoft,
+            borderRadius: BorderRadius.circular(9),
+          ),
+          child: Icon(_fileGlyph(msg.fileName ?? ''), size: 19, color: icon),
+        ),
+        const SizedBox(width: 10),
+        Flexible(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                msg.fileName ?? 'file',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w500, color: fg, height: 1.5, letterSpacing: 0),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                sz != null ? '$ext · ${_humanSize(sz)}' : ext,
+                style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 9, fontWeight: FontWeight.w500, color: sub, letterSpacing: 0.12),
+              ),
+            ],
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+void _openFullImage(BuildContext context, String path, {bool secure = false}) {
+  // drop the composer's focus first, else popping the viewer brings the
+  // keyboard back up over the chat
+  FocusManager.instance.primaryFocus?.unfocus();
+  // the flag is per window, so the photo is protected and the chat around
+  // it is not. a screen that already forced it (a room, a marked chat)
+  // keeps it: the flag is one bool
+  final wasForced = appState.secureForced;
+  if (secure && !wasForced) appState.forceSecure(true);
+  Navigator.of(context)
+      .push(
+        MaterialPageRoute(
+          fullscreenDialog: true,
+          builder: (ctx) => GestureDetector(
+            onTap: () => Navigator.of(ctx).pop(),
+            child: Scaffold(
+              backgroundColor: Colors.black,
+              body: SafeArea(
+                child: Center(
+                  child: InteractiveViewer(
+                    minScale: 1,
+                    maxScale: 4,
+                    child: Image.file(
+                      File(path),
+                      cacheWidth: screenPx(ctx, times: 2),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      )
+      .then((_) {
+        if (secure && !wasForced) appState.forceSecure(false);
+        FocusManager.instance.primaryFocus?.unfocus();
+      });
+}
+
+// the time and tick on a photo or a video with no caption: a small dark pill
+// in the corner, since there is no bubble under it to carry them
+Widget _mediaStamp(_Msg msg, bool pending, bool failedShown, bool ackOk) =>
+    Container(
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.45),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            _fmtTime(msg.when),
+            style: TextStyle(
+              fontFamily: UmbraTypography.fontMono,
+              fontFamilyFallback: HaloType.monoFallbackNow,
+              fontSize: 9,
+              color: Colors.white,
+              letterSpacing: track(0.4),
+            ),
+          ),
+          const SizedBox(width: 3),
+          if (!pending && !failedShown && ackOk) ...[
+            Text(
+              '✓',
+              style: const TextStyle(
+                fontSize: 10,
+                color: Colors.white,
+                fontWeight: FontWeight.w700,
+                height: 1,
+              ),
+            ),
+            if (msg.delivered) ...[
+              const SizedBox(width: 4),
+              Text(
+                l10n.chatDelivered,
+                style: TextStyle(
+                  fontFamily: UmbraTypography.fontMono,
+                  fontFamilyFallback: HaloType.monoFallbackNow,
+                  fontSize: 8.5,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.white,
+                  letterSpacing: track(0.3),
+                ),
+              ),
+            ],
+          ],
+        ],
+      ),
+    );
+
+// the phone cannot send at all: no network, or onion mode without a route
+bool _cannotSend() => !appState.online || !appState.torReady;
+
+// a failed send only reads as failed when the phone cannot send, or when
+// it has retried itself to the cap. online, the row keeps going on its own
+// and shows as pending.
+bool _sendLooksFailed(_Msg m) => m.failed && (m.gaveUp || _cannotSend());
+
+String _friendlyStatus(String raw) {
+  if (raw.isEmpty || raw == 'parked') return '';
+  if (!appState.online && raw.startsWith('error:')) {
+    return l10n.chatYouAreOfflineThis;
+  }
+  if (raw.startsWith('error:') && !appState.torReady) {
+    return l10n.chatStillConnectingToTor;
+  }
+  // online, a transport error is not the user's problem: the row retries
+  // itself and the bubble stays pending. no line.
+  if (raw.startsWith('error:')) return '';
+  return raw;
+}
+
+String _fmtFull(DateTime d) {
+  return '${dayMonthMaybeYear(d)} · ${hourMinute(d)}';
+}
+
+String _fmtTime(DateTime d) => hourMinute(d);
+
+String _humanBurn(int seconds) {
+  if (seconds < 60) return l10n.chatS(whole(seconds));
+  if (seconds < 3600) return l10n.chatM(whole(seconds ~/ 60));
+  if (seconds < 86400) return l10n.chatH(whole(seconds ~/ 3600));
+  return l10n.chatD(whole(seconds ~/ 86400));
+}
+
+String _fmtBurn(int burnAtMs) {
+  final now = DateTime.now().millisecondsSinceEpoch;
+  var s = ((burnAtMs - now) / 1000).round();
+  if (s <= 0) return l10n.chat0s;
+  final h = s ~/ 3600;
+  s -= h * 3600;
+  final m = s ~/ 60;
+  s -= m * 60;
+  if (h > 0) return l10n.chatHM(whole(h), twoDigits(m));
+  if (m > 0) return l10n.chatMS(whole(m), twoDigits(s));
+  return l10n.chatS2(whole(s));
+}
+
+// isolate entrypoint for compute(): grinds first-contact pow
+int _grindPowTask(String seed) => grindPow(seed, powBits);
+
+int _lastBurnSeconds = 300;
+bool _lastGhost = false;
+
+class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
+  final _msgCtrl = TextEditingController();
+  int _unreadAfterMs = 0;
+  int _firstUnreadIndex = -1;
+  bool _unreadResolved = false;
+  bool _ghost = _lastGhost; // restored from last use this session.
+  // marks the next message so the other phone blocks screenshots of it. off
+  // by default, since then neither side can screenshot the chat.
+  bool _secureNext = false;
+  bool _disguise = false;
+  int _burnSeconds = _lastBurnSeconds; // restored from last use this session.
+  Timer? _burnTick;
+  int _lastBurnSec = 0;
+  final _scrollCtrl = ScrollController();
+  static const _pageSize = 60;
+  bool _hasMore = false;
+  bool _loadingOlder = false;
+  // set once the user paged deep or jumped - reloads keep the full thread
+  // so their scroll position doesn't collapse back to one page.
+  bool _pagedOut = false;
+
+  Future<void> _loadOlder() async {
+    if (_loadingOlder || !_hasMore) return;
+    _loadingOlder = true;
+    try {
+      final oldest = _messages.isEmpty ? null : _messages.first.rowid;
+      final rows = await db.messagesPage(
+        widget.peerHaloId,
+        beforeRowid: oldest,
+        limit: _pageSize + 1,
+      );
+      if (!mounted) return;
+      _hasMore = rows.length > _pageSize;
+      if (_hasMore) rows.removeAt(0);
+      if (!_hasMore) _pagedOut = true;
+      final older = <_Msg>[];
+      final uids = <String>[];
+      for (final r in rows) {
+        final uid = r['msg_uid'] as String?;
+        final m = _Msg(
+          r['direction'] as String,
+          r['plaintext'] as String,
+          DateTime.fromMillisecondsSinceEpoch(r['sent_at'] as int),
+          burnAt: r['burn_at'] as int?,
+          msgUid: uid,
+          replyTo: r['reply_to'] as String?,
+          secure: (r['secure'] as int? ?? 0) == 1,
+          edited: (r['edited'] as int? ?? 0) == 1,
+          pinned: (r['pinned'] as int? ?? 0) == 1,
+          mediaPath: r['media_path'] as String?,
+          filePath: r['file_path'] as String?,
+          fileName: r['file_name'] as String?,
+          voiceDisguised: (r['voice_disguised'] as int? ?? 0) == 1,
+          saved: (r['saved'] as int? ?? 0) == 1,
+        );
+        m.rowid = (r['rowid'] as int?) ?? 0;
+        final pvRaw = r['preview'] as String?;
+        if (pvRaw != null && pvRaw.isNotEmpty) {
+          try {
+            final dd = jsonDecode(pvRaw) as Map<String, dynamic>;
+            m.preview = dd.map((k, v) => MapEntry(k, v.toString()));
+          } catch (_) {}
+        }
+        if (uid != null) {
+          uids.add(uid);
+          _seenUids.add(uid);
+        }
+        older.add(m);
+      }
+      final reactionMap = await db.loadReactionsFor(uids);
+      for (final m in older) {
+        final entries = reactionMap[m.msgUid];
+        if (entries == null) continue;
+        for (final en in entries) {
+          m.reactions[en.key] = en.value;
+        }
+      }
+      if (!mounted || older.isEmpty) return;
+      setState(() {
+        _messages.insertAll(0, older);
+        _normaliseMessages();
+      });
+    } finally {
+      _loadingOlder = false;
+    }
+  }
+
+  void _onScrollPage() {
+    if (!_hasMore || !_scrollCtrl.hasClients) return;
+    final p = _scrollCtrl.position;
+    if (p.pixels > p.maxScrollExtent - 600) _loadOlder();
+  }
+
+  // keyed by the message the divider sits above, not by the day, so two
+  // dividers can never hold the same key. _dayMsOf maps a key back to the
+  // day it represents for the sticky header.
+  final Map<String, GlobalKey> _dayKeys = {};
+  final Map<String, int> _dayMsOf = {};
+
+  // the keys belong to messages, so they go when the messages do
+  void _forgetDayKeys() {
+    _dayKeys.clear();
+    _dayMsOf.clear();
+  }
+
+  final GlobalKey _listKey = GlobalKey();
+  final ValueNotifier<String?> _stickyLabel = ValueNotifier(null);
+  final ValueNotifier<bool> _stickyShown = ValueNotifier(false);
+  int? _stickyDayMs;
+  String? _revealedUid;
+  Timer? _stickyHideTimer;
+  bool _suppressSticky = true;
+  final List<_Msg> _messages = [];
+
+  // every path that touches the list ends here. an out-of-order list gives
+  // one day two dividers, and their shared GlobalKey takes the whole chat
+  // out of the widget tree.
+  void _normaliseMessages() {
+    _messages.sort((a, b) => a.when.compareTo(b.when));
+    final seen = <String>{};
+    _messages.retainWhere((m) {
+      final id = m.msgUid;
+      if (id == null) return true;
+      return seen.add(id);
+    });
+    // quoted replies resolve through here rather than scanning the list once
+    // per visible row.
+    _byUid
+      ..clear()
+      ..addEntries(
+        _messages
+            .where((m) => m.msgUid != null)
+            .map((m) => MapEntry(m.msgUid!, m)),
+      );
+  }
+
+  final Map<String, _Msg> _byUid = {};
+
+  bool _loaded = false;
+  Atmo _atmosphere = Atmo.none;
+  // a photo of their own behind this chat. lives in the app's folder, so
+  // it goes with a wipe; stored as image:<path> in the atmosphere column.
+  String? _wallpaperPath;
+  String _status = '';
+  bool _loading = false;
+  bool _reloadPending = false;
+  Timer? _pollTimer;
+  bool _sending = false;
+  // serialize signal encryption across sends. a fast burst must not encrypt
+  // every message against the same pre-session state, or they all come out as
+  // prekey messages fighting over one one-time key and only the first lands.
+  Future<void> _encryptGate = Future.value();
+  // seeded from the qr/contact key so the first send works before any
+  // session exists. the session lookup in initState only refreshes it.
+  late String? _peerXPub = widget.peerXPub.isEmpty ? null : widget.peerXPub;
+  bool _backPaired = false;
+  // the message being replied to. cleared after send or by the X in the
+  // quote bar.
+  _Msg? _replyTo;
+
+  // search in chat. _matches are indices into _messages, _matchPos the
+  // current hit, _matchKeys let a hit be scrolled into view.
+  bool _searching = false;
+  final _searchCtrl = TextEditingController();
+  String _query = '';
+  String? _liftedUid;
+  List<int> _matches = [];
+  // same hits as _matches, for the per-row "is this one" test
+  Set<int> _matchSet = {};
+  int _matchPos = 0;
+  final Map<int, GlobalKey> _matchKeys = {};
+  String? _nickname;
+  late int? _peerFace = widget.avatarChoice;
+  bool _blocked = false;
+  bool _muted = false;
+  bool _verified = false;
+  String? _peerBadge;
+  bool _keyChanged = false;
+
+  Future<void> _dismissKeyChanged() async {
+    await db.setKeyChanged(widget.peerHaloId, false);
+    if (mounted) setState(() => _keyChanged = false);
+  }
+
+  // request-lock state: a stranger we haven't accepted, capped at 2 sent msgs.
+  bool _accepted = true; // assume ok until loaded, so normal chats don't flash
+  bool _peerEngaged = false; // they've replied/back-paired -> lock lifts
+  int _sentCount = 0;
+  int _recvCount =
+      0; // messages they've sent us; >0 + unaccepted = a request TO us
+  // sender-side lock: messaging a stranger who hasn't accepted, past the cap.
+  // once they engage (reply/back-pair) or we accept them, it clears.
+  bool get _requestPending => !_peerEngaged && _recvCount == 0;
+  bool get _requestLocked => _requestPending && _sentCount >= 2 && !_vouched;
+  // receiver-side: a stranger has messaged us and we haven't accepted yet.
+  bool get _incomingRequest => !_accepted && _recvCount > 0;
+  // friends vouched for this peer. no sender-side cap then: the other end
+  // skips its gate for us, so locking ourselves would be the only lock left.
+  List<String> _voucherNames = const [];
+  String? _voucherSeed; // first voucher, whose face the chip wears
+  int? _voucherAvatar;
+  bool _voucherVerified = false;
+  bool get _vouched => _voucherNames.isNotEmpty;
+  // what the scam shield saw on this stranger, if anything and not ignored
+  ShieldFlag? _flag;
+  // the shield looked at their opener and found nothing
+  bool _shieldClean = false;
+  bool _showScrollDown = false;
+  int _seenCount = 0;
+  String? _rippleUid;
+  _Msg? _replyFlash;
+  String? _note;
+
+  @override
+  void initState() {
+    super.initState();
+
+    _applySecureContent();
+    WidgetsBinding.instance.addObserver(this);
+    _reconcileSending();
+    appState.loadGhostPref().then((p) {
+      if (mounted) {
+        setState(() {
+          _ghost = p.$1;
+          _burnSeconds = p.$2;
+          _lastGhost = p.$1;
+          _lastBurnSeconds = p.$2;
+        });
+      }
+    });
+    appState.loadDisguisePref().then((d) {
+      if (mounted) setState(() => _disguise = d);
+    });
+    appState.addListener(_onAppStateChanged);
+    appState.loadSendMode();
+    lockState.addListener(_lockLifted);
+    currentChatPeer = widget.peerHaloId;
+    db.clearUnread(widget.peerHaloId).then((_) => appState.refreshContacts());
+    unawaited(clearNotificationsFor(widget.peerHaloId));
+    _unreadAfterMs =
+        _lastReadPerPeer[widget.peerHaloId] ??
+        DateTime.now().millisecondsSinceEpoch;
+    if (widget.initialText != null) {
+      _msgCtrl.text = widget.initialText!;
+    } else {
+      _msgCtrl.text = _draftPerPeer[widget.peerHaloId] ?? '';
+    }
+    // save the draft live on every keystroke so it survives leaving the chat
+    // regardless of when dispose runs.
+    _msgCtrl.addListener(() {
+      final t = _msgCtrl.text;
+      if (t.trim().isEmpty) {
+        _draftPerPeer.remove(widget.peerHaloId);
+      } else {
+        _draftPerPeer[widget.peerHaloId] = t;
+      }
+    });
+    db.getContact(widget.peerHaloId).then((c) {
+      if (mounted) {
+        setState(() {
+          _nickname = c?['nickname'] as String?;
+          _note = c?['note'] as String?;
+          _peerFace = (c?['avatar'] as num?)?.toInt() ?? _peerFace;
+        });
+      }
+    });
+    _loadVouches();
+    _loadShield();
+    db.getAtmosphere(widget.peerHaloId).then((a) {
+      if (!mounted) return;
+      setState(() {
+        if (a != null && a.startsWith('image:')) {
+          _wallpaperPath = a.substring(6);
+          _atmosphere = Atmo.none;
+        } else {
+          _atmosphere = atmoFromName(a);
+        }
+      });
+    });
+    signalSession.peerXPubHex(widget.peerHaloId).then((v) {
+      // only adopt the session value if we don't already have the widget key;
+      // never clobber a good key with a null the store hasn't filled yet.
+      if (mounted && v != null && v.isNotEmpty) {
+        setState(() => _peerXPub = v);
+      }
+    });
+    db.isBackPaired(widget.peerHaloId).then((v) {
+      if (mounted) setState(() => _backPaired = v);
+    });
+    db.keyChanged(widget.peerHaloId).then((v) {
+      if (mounted) setState(() => _keyChanged = v);
+    });
+    _scrollCtrl.addListener(_onScrollPage);
+    db.isBlocked(widget.peerHaloId).then((v) {
+      if (mounted) setState(() => _blocked = v);
+    });
+    db.isMuted(widget.peerHaloId).then((v) {
+      if (mounted) setState(() => _muted = v);
+    });
+    db.isVerified(widget.peerHaloId).then((v) {
+      if (mounted) setState(() => _verified = v);
+    });
+    db.getContact(widget.peerHaloId).then((c) {
+      if (mounted) {
+        setState(() => _peerBadge = c?['supporter_badge'] as String?);
+      }
+    });
+    // request lock: are they an accepted contact, have they engaged, and how
+    // many messages have we already sent while unaccepted.
+    db.isAccepted(widget.peerHaloId).then((v) {
+      if (mounted) setState(() => _accepted = v);
+    });
+    db.isBackPaired(widget.peerHaloId).then((v) {
+      if (mounted) setState(() => _peerEngaged = v);
+    });
+    db.countMessagesTo(widget.peerHaloId).then((v) {
+      if (mounted) setState(() => _sentCount = v);
+    });
+    db.countMessagesFrom(widget.peerHaloId).then((v) {
+      if (mounted) setState(() => _recvCount = v);
+    });
+    _scrollCtrl.addListener(_onScroll);
+    _scrollCtrl.addListener(_updateSticky);
+    Future.delayed(const Duration(milliseconds: 1200), () {
+      if (mounted) _suppressSticky = false;
+    });
+    _loadMessages();
+    _burnTick = Timer.periodic(const UmbraMotion.durationFast, (_) {
+      if (!mounted) return;
+      final now = DateTime.now().millisecondsSinceEpoch;
+      // one pass, and no list unless something burnt: this runs ten times
+      // a second while the chat is open
+      List<_Msg>? expired;
+      var anyGhost = false;
+      for (final m in _messages) {
+        if (m.burnAt == null) continue;
+        anyGhost = true;
+        if (m.burnAt! <= now && !m.removing && !m.sending && !m.failed) {
+          (expired ??= []).add(m);
+        }
+      }
+      if (!anyGhost) return;
+      if (expired != null) {
+        for (final m in expired) {
+          m.removing = true;
+          // wait for the full _BurnFade dissolve (520ms) before pulling the
+          // row, else the animation cuts off and the message pops away.
+          Future.delayed(const Duration(milliseconds: 560), () async {
+            if (mounted) setState(() => _messages.remove(m));
+            if (m.msgUid != null) await db.deleteMessage(m.msgUid!);
+            // the home row was previewing what just burned
+            unawaited(appState.refreshContacts());
+          });
+        }
+        HapticFeedback.lightImpact();
+      }
+      // _BurnFade dissolves itself, so the timer only has to repaint when
+      // something just expired or the countdown text changes second.
+      final sec = now ~/ 1000;
+      if (expired != null || sec != _lastBurnSec) {
+        _lastBurnSec = sec;
+        setState(() {});
+      }
+    });
+
+    _autoRetryTimer = Timer.periodic(
+      const Duration(seconds: 30),
+      (_) => _autoRetryTick(),
+    );
+    _pollTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      _checkInbox();
+    });
+  }
+
+  int _lastRev = -1;
+
+  void _onAppStateChanged() {
+    if (!mounted) return;
+    _retryFailedOnReconnect();
+    // only touch the message list when this thread changed: reloading on
+    // every app notify is a lag spike in long chats
+    final rev = appState.chatRevOf(widget.peerHaloId);
+    if (rev != _lastRev) {
+      _lastRev = rev;
+      _tryAppendNew();
+      unawaited(_refreshDelivered());
+    }
+    _refreshRequestState();
+    if (!_accepted && _flag == null) _loadShield();
+  }
+
+  // who vouched, as we know them. only accepted contacts come back, so a
+  // voucher we deleted since simply stops being named.
+  Future<void> _loadVouches() async {
+    final vs = await db.vouchesFor(widget.peerHaloId);
+    if (!mounted) return;
+    setState(() {
+      _voucherNames = [
+        for (final v in vs)
+          (v['nickname'] as String?) ?? v['voucher_id'] as String,
+      ];
+      if (vs.isNotEmpty) {
+        _voucherSeed = vs.first['voucher_id'] as String;
+        _voucherAvatar = (vs.first['avatar'] as num?)?.toInt();
+        _voucherVerified =
+            vs.length == 1 && (vs.first['verified'] as int? ?? 0) == 1;
+      }
+    });
+  }
+
+  Future<void> _loadShield() async {
+    if (await db.isAccepted(widget.peerHaloId)) return;
+    final row = await db.shieldFor(widget.peerHaloId);
+    final f = ShieldFlag.fromRow(row);
+    final clean = ShieldFlag.cleanRow(row);
+    if (mounted && (f != _flag || clean != _shieldClean)) {
+      setState(() {
+        _flag = f;
+        _shieldClean = clean;
+      });
+    }
+  }
+
+  Future<void> _openShield() async {
+    final f = _flag;
+    if (f == null) return;
+    final c = await showShieldSheet(context, widget.peerHaloId, f);
+    if (!mounted || c == null) return;
+    if (c == ShieldChoice.ignore) {
+      setState(() => _flag = null);
+    } else {
+      Navigator.pop(context);
+    }
+  }
+
+  // a reply can land while the sender sits in the locked chat, so re-check
+  // whenever something arrives
+  void _refreshRequestState() {
+    if (_accepted && _peerEngaged && _recvCount > 0) return;
+    db.isAccepted(widget.peerHaloId).then((v) {
+      if (mounted && v != _accepted) setState(() => _accepted = v);
+    });
+    db.isBackPaired(widget.peerHaloId).then((v) {
+      if (mounted && v != _peerEngaged) setState(() => _peerEngaged = v);
+    });
+    db.countMessagesFrom(widget.peerHaloId).then((v) {
+      if (mounted && v != _recvCount) setState(() => _recvCount = v);
+    });
+  }
+
+  void _retryAny(_Msg m) {
+    if (m.mediaPath != null) {
+      _retryImage(m);
+    } else if (m.filePath != null) {
+      _retryMedia(m);
+    } else {
+      _retry(m);
+    }
+  }
+
+  Timer? _autoRetryTimer;
+  // online, a failed send goes again on its own: half a minute apart, six
+  // goes, then it is shown as failed. the reconnect retry below covers the
+  // offline case; this covers a route that was simply slow or flaky.
+  void _autoRetryTick() {
+    if (!mounted || _sending || _cannotSend()) return;
+    for (final m in _messages) {
+      if (m.direction != 'out' || !m.failed || m.gaveUp || m.msgUid == null) {
+        continue;
+      }
+      if (m.autoRetries >= 6) {
+        setState(() => m.gaveUp = true);
+        continue;
+      }
+      m.autoRetries++;
+      _retryAny(m);
+    }
+  }
+
+  // when tor comes back, re-fire what failed while offline, never rows still
+  // sending. the _wasReachable edge makes it once per reconnect.
+  void _retryFailedOnReconnect() {
+    final reachable = _torReadyToSend();
+    if (reachable && !_wasReachable) {
+      // clear any stale send error, we're about to resend
+      if (_status.isNotEmpty) setState(() => _status = '');
+      for (final m in _messages) {
+        if (m.direction == 'out' && m.failed && m.msgUid != null) {
+          if (m.mediaPath != null) {
+            _retryImage(m);
+          } else if (m.filePath != null) {
+            _retryMedia(m);
+          } else {
+            _retry(m);
+          }
+        }
+      }
+    }
+    _wasReachable = reachable;
+  }
+
+  // a receipt flips `delivered` in the db for a bubble already on screen,
+  // which _tryAppendNew won't catch, so re-read it in place. the send state
+  // too: a long upload may have been finished by an earlier screen, and the
+  // database is the one that knows.
+  Future<void> _refreshDelivered() async {
+    final pending = _messages
+        .where(
+          (m) =>
+              m.direction == 'out' &&
+              m.msgUid != null &&
+              (!m.delivered || m.sending || m.parked || m.failed),
+        )
+        .toList();
+    if (pending.isEmpty) return;
+    var changed = false;
+    for (final m in pending) {
+      final s = await db.sendState(m.msgUid!);
+      if (s.delivered && !m.delivered) {
+        m.delivered = true;
+        changed = true;
+      }
+      final done = s.delivered || (s.sent && !mediaInflight.contains(m.msgUid));
+      if (done && (m.sending || m.parked || m.failed)) {
+        m.sending = false;
+        m.parked = false;
+        m.failed = false;
+        if (m.msgUid != null) mediaProgressEnd(m.msgUid!);
+        changed = true;
+      }
+    }
+    if (changed && mounted) setState(() {});
+  }
+
+  // fast path for a live message: append rows newer than the newest we hold,
+  // so a full rebuild does not eat the bubble-in animation
+  Future<void> _tryAppendNew() async {
+    if (!_loaded || _searching) {
+      _loadMessages();
+      return;
+    }
+    final lastRowid = _messages.isEmpty
+        ? 0
+        : _messages.map((m) => m.rowid).reduce((a, b) => a > b ? a : b);
+    final rows = await db.messagesAfter(widget.peerHaloId, lastRowid);
+    if (!mounted) return;
+    final have = _messages.map((m) => m.msgUid).toSet();
+    // no new row we don't already hold means a full reload: covers edits,
+    // reactions, deletes and clock skew (a received msg older than our newest)
+    final brandNew = rows
+        .where(
+          (r) =>
+              (r['msg_uid'] as String?) != null &&
+              !have.contains(r['msg_uid'] as String?),
+        )
+        .toList();
+    if (brandNew.isEmpty) {
+      _loadMessages();
+      return;
+    }
+    final fresh = <_Msg>[];
+    for (final r in brandNew) {
+      final uid = r['msg_uid'] as String?;
+      final m = _Msg(
+        r['direction'] as String,
+        r['plaintext'] as String,
+        DateTime.fromMillisecondsSinceEpoch(r['sent_at'] as int),
+        burnAt: r['burn_at'] as int?,
+        msgUid: uid,
+        replyTo: r['reply_to'] as String?,
+        secure: (r['secure'] as int? ?? 0) == 1,
+        edited: (r['edited'] as int? ?? 0) == 1,
+        pinned: (r['pinned'] as int? ?? 0) == 1,
+        mediaPath: r['media_path'] as String?,
+        filePath: r['file_path'] as String?,
+        fileName: r['file_name'] as String?,
+        voiceDisguised: (r['voice_disguised'] as int? ?? 0) == 1,
+        saved: (r['saved'] as int? ?? 0) == 1,
+        delivered: (r['delivered'] as int? ?? 0) == 1,
+        sending:
+            (r['direction'] as String) == 'out' &&
+            (r['sent'] as int? ?? 1) == 0,
+      );
+      m.rowid = (r['rowid'] as int?) ?? 0;
+      final pvRaw = r['preview'] as String?;
+      if (pvRaw != null && pvRaw.isNotEmpty) {
+        try {
+          final d = jsonDecode(pvRaw) as Map<String, dynamic>;
+          m.preview = d.map((k, v) => MapEntry(k, v.toString()));
+        } catch (_) {}
+      }
+      if (m.direction != 'out' && uid != null) m.fresh = true;
+      fresh.add(m);
+      if (uid != null) _seenUids.add(uid);
+    }
+    setState(() {
+      _messages.addAll(fresh);
+      _normaliseMessages();
+    });
+    _applySecureContent();
+    // clear the home badge for what we are reading. a backed-out chat stays
+    // in the tree for a while, so only the open chat gets to clear.
+    if (fresh.any((m) => m.direction != 'out') &&
+        currentChatPeer == widget.peerHaloId) {
+      unawaited(db.clearUnread(widget.peerHaloId));
+      unawaited(appState.refreshContacts());
+    }
+    _scrollToEnd();
+  }
+
+  Widget _newMessagesDivider() {
+    final line = Container(
+      height: 0.5,
+      color: colors.accent.withValues(alpha: 0.35),
+    );
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 10),
+      child: Row(
+        children: [
+          Expanded(child: line),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 10),
+            child: Text(
+              l10n.chatNewMessages,
+              style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 9.5, fontWeight: FontWeight.w500, color: colors.accent, letterSpacing: 1.5),
+            ),
+          ),
+          Expanded(
+            child: Container(
+              height: 0.5,
+              color: colors.accent.withValues(alpha: 0.35),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ---- search ----------------------------------------------------------
+
+  void _openSearch() {
+    setState(() => _searching = true);
+    // the page holds the last sixty; a search wants all of it
+    _loadMessages();
+  }
+
+  void _closeSearch() {
+    setState(() {
+      _searching = false;
+      _query = '';
+      _searchCtrl.clear();
+      _matches = [];
+      _matchSet = {};
+      _matchPos = 0;
+      _matchKeys.clear();
+    });
+  }
+
+  // recompute matches whenever the query changes. jumps to the most
+  // recent hit (bottom of the list) by default, then scrolls it in.
+  void _onQueryChanged(String q) {
+    final query = q.trim();
+    final matches = <int>[];
+    if (query.isNotEmpty) {
+      final lower = query.toLowerCase();
+      for (var i = 0; i < _messages.length; i++) {
+        if (_messages[i].text.toLowerCase().contains(lower)) {
+          matches.add(i);
+        }
+      }
+    }
+    setState(() {
+      _query = query;
+      _matches = matches;
+      _matchSet = matches.toSet();
+      _matchPos = matches.isEmpty ? 0 : matches.length - 1;
+      _matchKeys
+        ..clear()
+        ..addEntries(matches.map((i) => MapEntry(i, GlobalKey())));
+    });
+    _scrollToCurrentMatch();
+  }
+
+  // chevrons: delta -1 = previous (older) hit, +1 = next (newer). wraps.
+  void _gotoMatch(int delta) {
+    if (_matches.isEmpty) return;
+    setState(() {
+      _matchPos = (_matchPos + delta) % _matches.length;
+      if (_matchPos < 0) _matchPos += _matches.length;
+    });
+    _scrollToCurrentMatch();
+  }
+
+  // rough jump so the match gets built, then ensureVisible to centre it.
+  // saves a scroll-to-index dependency.
+  void _scrollToCurrentMatch() {
+    if (_matches.isEmpty || !_scrollCtrl.hasClients) return;
+    final idx = _matches[_matchPos];
+    if (_messages.isNotEmpty) {
+      // reversed list: newest is at offset 0, so a message at index idx sits at
+      // roughly (len-1-idx)/len of the extent.
+      final frac = (_messages.length - 1 - idx) / _messages.length;
+      final approx = frac * _scrollCtrl.position.maxScrollExtent;
+      if (_scrollReady) {
+        _scrollCtrl.jumpTo(
+          approx.clamp(0.0, _scrollCtrl.position.maxScrollExtent),
+        );
+      }
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final ctx = _matchKeys[idx]?.currentContext;
+      if (ctx != null) {
+        Scrollable.ensureVisible(
+          ctx,
+          duration: const Duration(milliseconds: 260),
+          curve: UmbraMotion.easeOut,
+          alignment: 0.4,
+        );
+      }
+    });
+  }
+
+  // the reaction pill above the long-pressed bubble, in an OverlayEntry so
+  // the list does not clip it
+  Future<void> _showEmojiPickerAt(
+    BuildContext bubbleContext,
+    _Msg target,
+  ) async {
+    HapticFeedback.selectionClick();
+    // a row without a uid gets a local one. the peer doesn't know it, so the
+    // reaction stays local.
+    if (target.msgUid == null) {
+      final uid = _newMsgUid();
+      target.msgUid = uid;
+      await db.assignUidIfMissing(
+        widget.peerHaloId,
+        target.when.millisecondsSinceEpoch,
+        uid,
+      );
+    }
+    // the lock went up while the uid was written: no menu
+    if (!mounted || !bubbleContext.mounted || lockGuard.isLocked()) return;
+    final box = bubbleContext.findRenderObject() as RenderBox?;
+    if (box == null) return;
+    final offset = box.localToGlobal(Offset.zero);
+    final bubbleSize = box.size;
+    const pickerH = 54.0;
+    const menuH = 200.0;
+    final screenH = MediaQuery.of(context).size.height;
+    final safeTop = MediaQuery.of(context).padding.top + 8;
+    final safeBottom = screenH - MediaQuery.of(context).padding.bottom - 12;
+    final bubbleTop = offset.dy;
+    final bubbleBottom = offset.dy + bubbleSize.height;
+    final aboveTop = bubbleTop - pickerH - 14;
+    double reactTop;
+    double? menuTop;
+    double? menuBottom;
+    if (aboveTop >= safeTop && safeBottom - bubbleBottom >= menuH + 14) {
+      reactTop = aboveTop;
+      menuTop = bubbleBottom + 10;
+    } else if (aboveTop >= safeTop) {
+      reactTop = aboveTop;
+      menuBottom = screenH - (reactTop - 8);
+    } else {
+      reactTop = bubbleBottom + 10;
+      menuTop = reactTop + pickerH + 8;
+    }
+    // pin the bar to the message's side so it never runs off the edge
+    final alignRight = target.direction == 'out';
+
+    if (mounted) setState(() => _liftedUid = target.msgUid);
+    late OverlayEntry entry;
+    VoidCallback? unguard;
+    // not entry.mounted: an entry closed before its first frame is not
+    // mounted yet and has to go all the same
+    var gone = false;
+    void dismiss() {
+      if (gone) return;
+      gone = true;
+      unguard?.call();
+      entry.remove();
+      if (mounted) setState(() => _liftedUid = null);
+    }
+
+    entry = OverlayEntry(
+      builder: (_) {
+        return Stack(
+          children: [
+            Positioned.fill(
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: dismiss,
+                child: const MenuBackdrop(),
+              ),
+            ),
+            PositionedDirectional(
+              start: offset.dx,
+              top: offset.dy,
+              width: bubbleSize.width,
+              child: IgnorePointer(
+                child: TweenAnimationBuilder<double>(
+                  tween: Tween(begin: 0.0, end: 1.0),
+                  duration: const Duration(milliseconds: 220),
+                  curve: UmbraMotion.easeOut,
+                  child: Material(
+                    type: MaterialType.transparency,
+                    child: _Bubble(msg: target),
+                  ),
+                  builder: (_, t, child) =>
+                      Transform.scale(scale: 1.0 + 0.04 * t, child: child),
+                ),
+              ),
+            ),
+
+            PositionedDirectional(
+              top: reactTop,
+              start: alignRight ? null : 12,
+              end: alignRight ? 12 : null,
+              child: MenuPop(
+                fromRight: alignRight,
+                child: _EmojiPickerBubble(
+                  emojis: const ['❤️', '👍', '😂', '😮', '😢', '🔥'],
+                  selected: target.reactions[''],
+                  onPick: (e) {
+                    dismiss();
+                    final added = target.reactions[''] != e;
+                    _toggleReaction(target, e);
+                    if (added) _flashReaction(target);
+                  },
+                  onReply: () {
+                    dismiss();
+                    setState(() {
+                      _replyTo = target;
+                      _replyFlash = target;
+                    });
+                    Future.delayed(const Duration(milliseconds: 700), () {
+                      if (mounted && identical(_replyFlash, target)) {
+                        setState(() => _replyFlash = null);
+                      }
+                    });
+                  },
+                ),
+              ),
+            ),
+            PositionedDirectional(
+              top: menuTop,
+              bottom: menuBottom,
+              start: alignRight ? null : 12,
+              end: alignRight ? 12 : null,
+              child: MenuPop(
+                fromRight: alignRight,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: target.direction == 'out'
+                      ? CrossAxisAlignment.end
+                      : CrossAxisAlignment.start,
+                  children: [
+                    Material(
+                      color: Colors.transparent,
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(999),
+                        onTap: () {
+                          dismiss();
+                          HapticFeedback.selectionClick();
+                          _toggleSaved(target);
+                        },
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 14,
+                            vertical: 8,
+                          ),
+                          decoration: BoxDecoration(
+                            color: colors.surfaceHover,
+                            border: Border.all(
+                              color: colors.separator,
+                              width: 0.5,
+                            ),
+                            borderRadius: BorderRadius.circular(999),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                target.saved
+                                    ? Icons.bookmark
+                                    : Icons.bookmark_border,
+                                size: 16,
+                                color: target.saved
+                                    ? colors.accent
+                                    : colors.textSecondary,
+                              ),
+                              const SizedBox(width: 8),
+                              Text(
+                                target.saved
+                                    ? l10n.chatUnsave
+                                    : l10n.commonSave,
+                                style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Material(
+                      color: Colors.transparent,
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(999),
+                        onTap: () {
+                          dismiss();
+                          HapticFeedback.selectionClick();
+                          _forwardMessage(target);
+                        },
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 14,
+                            vertical: 8,
+                          ),
+                          decoration: BoxDecoration(
+                            color: colors.surfaceHover,
+                            border: Border.all(
+                              color: colors.separator,
+                              width: 0.5,
+                            ),
+                            borderRadius: BorderRadius.circular(999),
+                          ),
+                          child: Text(
+                            l10n.chatForward,
+                            style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+                          ),
+                        ),
+                      ),
+                    ),
+                    // a tap opens a file, so sharing it lives here
+                    if (target.filePath != null &&
+                        target.fileName != 'voice.wav') ...[
+                      const SizedBox(height: 6),
+                      Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                          borderRadius: BorderRadius.circular(999),
+                          onTap: () {
+                            dismiss();
+                            HapticFeedback.selectionClick();
+                            lockState.hold(
+                              () => SharePlus.instance.share(
+                                ShareParams(files: [XFile(target.filePath!)]),
+                              ),
+                            );
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                              vertical: 8,
+                            ),
+                            decoration: BoxDecoration(
+                              color: colors.surfaceHover,
+                              border: Border.all(
+                                color: colors.separator,
+                                width: 0.5,
+                              ),
+                              borderRadius: BorderRadius.circular(999),
+                            ),
+                            child: Text(
+                              l10n.commonShare,
+                              style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                    if (target.text.isNotEmpty) ...[
+                      const SizedBox(height: 6),
+                      Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                          borderRadius: BorderRadius.circular(999),
+                          onTap: () {
+                            dismiss();
+                            HapticFeedback.selectionClick();
+                            Clipboard.setData(ClipboardData(text: target.text));
+                            showHaloToast(context, l10n.commonCopied);
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                              vertical: 8,
+                            ),
+                            decoration: BoxDecoration(
+                              color: colors.surfaceHover,
+                              border: Border.all(
+                                color: colors.separator,
+                                width: 0.5,
+                              ),
+                              borderRadius: BorderRadius.circular(999),
+                            ),
+                            child: Text(
+                              l10n.commonCopy,
+                              style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 6),
+                    Material(
+                      color: Colors.transparent,
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(999),
+                        onTap: () {
+                          dismiss();
+                          HapticFeedback.selectionClick();
+                          _togglePin(target);
+                        },
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 14,
+                            vertical: 8,
+                          ),
+                          decoration: BoxDecoration(
+                            color: colors.surfaceHover,
+                            border: Border.all(
+                              color: colors.separator,
+                              width: 0.5,
+                            ),
+                            borderRadius: BorderRadius.circular(999),
+                          ),
+                          child: Text(
+                            target.pinned ? l10n.chatUnpin : l10n.chatPin,
+                            style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+                          ),
+                        ),
+                      ),
+                    ),
+                    if (target.direction == 'out') ...[
+                      const SizedBox(height: 6),
+                      Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                          borderRadius: BorderRadius.circular(999),
+                          onTap: () {
+                            dismiss();
+                            HapticFeedback.selectionClick();
+                            // a photo or file still on its way stops here
+                            // and the other side drops what it has
+                            if (target.sending &&
+                                (target.mediaPath != null ||
+                                    target.filePath != null)) {
+                              _stopSending(target);
+                            } else {
+                              _unsendMessage(target);
+                            }
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                              vertical: 8,
+                            ),
+                            decoration: BoxDecoration(
+                              color: colors.surfaceHover,
+                              border: Border.all(
+                                color: colors.separator,
+                                width: 0.5,
+                              ),
+                              borderRadius: BorderRadius.circular(999),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  Icons.delete_outline,
+                                  size: 14,
+                                  color: colors.error,
+                                ),
+                                const SizedBox(width: 6),
+                                Text(
+                                  target.sending &&
+                                          (target.mediaPath != null ||
+                                              target.filePath != null)
+                                      ? l10n.chatStopSending
+                                      : l10n.chatUnsend,
+                                  style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 12, fontWeight: FontWeight.w500, color: colors.error, height: 1.5, letterSpacing: 0),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                      // words can be edited; a photo, a file or a voice note
+                      // is what it is
+                      if (target.mediaPath == null &&
+                          target.filePath == null) ...[
+                        const SizedBox(height: 6),
+                        Material(
+                          color: Colors.transparent,
+                          child: InkWell(
+                            borderRadius: BorderRadius.circular(999),
+                            onTap: () {
+                              dismiss();
+                              _editMessage(target);
+                            },
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 14,
+                                vertical: 8,
+                              ),
+                              decoration: BoxDecoration(
+                                color: colors.surfaceHover,
+                                border: Border.all(
+                                  color: colors.separator,
+                                  width: 0.5,
+                                ),
+                                borderRadius: BorderRadius.circular(999),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: Colors.black.withValues(alpha: 0.5),
+                                    blurRadius: 20,
+                                    offset: const Offset(0, 6),
+                                  ),
+                                ],
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    Icons.edit_outlined,
+                                    size: 14,
+                                    color: colors.accent,
+                                  ),
+                                  const SizedBox(width: 6),
+                                  Text(
+                                    l10n.commonEdit,
+                                    style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 12, fontWeight: FontWeight.w500, color: colors.accent, height: 1.5, letterSpacing: 0),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+    Overlay.of(context).insert(entry);
+    // the lock closes it, with what it shows
+    unguard = lockGuard.closeOnLock(dismiss);
+  }
+
+  // the list is read from the database, not from the rows on screen: a pin
+  // far up the thread is still a pin when only the last page is loaded
+  Future<List<PinEntry>> _loadPins() async {
+    final rows = await db.pinnedIn(peerId: widget.peerHaloId);
+    final nick = _nickname;
+    final them = (nick != null && nick.isNotEmpty) ? nick : widget.peerHaloId;
+    return [
+      for (final r in rows)
+        PinEntry(
+          uid: r['msg_uid'] as String,
+          author: r['direction'] == 'out' ? l10n.chatYou : them,
+          authorSeed: r['direction'] == 'out'
+              ? appState.myId
+              : widget.avatarSeed,
+          face: r['direction'] == 'out' ? appState.myAvatar : _peerFace,
+          when: DateTime.fromMillisecondsSinceEpoch(r['sent_at'] as int),
+          text: (r['plaintext'] as String?) ?? '',
+          imagePath: r['media_path'] as String?,
+          fileName: r['file_name'] as String?,
+        ),
+    ];
+  }
+
+  int _pinCount = 0;
+  Future<void> _refreshPinCount() async {
+    final n = (await db.pinnedIn(peerId: widget.peerHaloId)).length;
+    if (mounted && n != _pinCount) setState(() => _pinCount = n);
+  }
+
+  Future<void> _showPinnedSheet() async {
+    FocusManager.instance.primaryFocus?.unfocus();
+    await showPinsSheet(
+      context,
+      load: _loadPins,
+      onJump: (e) => _jumpToPin(e.uid),
+      onUnpin: (e) => _setPinned(e.uid, false),
+    );
+  }
+
+  Future<void> _setPinned(String uid, bool on) async {
+    // for both of us: the other side mirrors it
+    await appState.pinInChat(widget.peerHaloId, uid, on);
+    if (!mounted) return;
+    setState(() {
+      for (final m in _messages) {
+        if (m.msgUid == uid) m.pinned = on;
+      }
+    });
+    await _refreshPinCount();
+  }
+
+  Future<void> _jumpToPin(String uid) async {
+    if (!_messages.any((m) => m.msgUid == uid)) {
+      // pinned above what is loaded: bring the whole thread in, and hold
+      // the reload's own snap to the newest message off while we do
+      _pagedOut = true;
+      _jumpActive = true;
+      await _loadMessages();
+      if (!mounted) return;
+    }
+    _jumpToUid(uid);
+  }
+
+  // the unsend frame on its own, the way a message would go. the other
+  // side drops the row, or the half-file and its banner if it never landed.
+  Future<void> _sendUnsendFrame(String uid) async {
+    try {
+      final wrapped = await wrapMessage('', unsend: uid);
+      final cipher = await signalEncryptSerial(widget.peerHaloId, wrapped);
+      final useDirectOnion = !_backPaired || _peerXPub == null;
+      await (useDirectOnion
+          ? engine.sendTo(widget.peerOnion, cipher)
+          : engine.nostrSend(_peerXPub!, cipher));
+    } catch (e) {
+      dlog('unsend send failed: $e');
+    }
+  }
+
+  // stop a photo or file mid-send. the workers end between slices, the row
+  // and the file go here, and the other side is told to drop its part.
+  Future<void> _stopSending(_Msg m) async {
+    final uid = m.msgUid;
+    if (uid == null) return;
+    cancelMediaSend(uid);
+    mediaProgressEnd(uid);
+    if (mounted) setState(() => m.removing = true);
+    await Future.delayed(const UmbraMotion.durationSlow);
+    await db.deleteMessage(uid);
+    if (mounted) setState(() => _messages.remove(m));
+    unawaited(appState.refreshContacts());
+    unawaited(_sendUnsendFrame(uid));
+  }
+
+  Future<void> _unsendMessage(_Msg m) async {
+    if (m.msgUid == null) return;
+    // the confirm sheet hands focus back to the composer on close, which pops
+    // the keyboard for no reason. let go of it now and again after.
+    FocusManager.instance.primaryFocus?.unfocus();
+    final confirm = await showHaloSheet<bool>(
+      context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const SheetHandle(),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 18, 20, 6),
+              child: Text(
+                l10n.chatUnsendMessage,
+                style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 18, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.normal, height: 1.05, letterSpacing: -0.015),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 0, 20, 14),
+              child: Text(
+                l10n.chatItDisappearsWithNo,
+                style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+              ),
+            ),
+            InkWell(
+              onTap: () => Navigator.pop(ctx, true),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 20,
+                  vertical: 16,
+                ),
+                child: Row(
+                  children: [
+                    Icon(
+                      Icons.delete_outline,
+                      size: 18,
+                      color: colors.error,
+                    ),
+                    const SizedBox(width: 14),
+                    Text(
+                      l10n.chatUnsend,
+                      style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w400, color: colors.error, height: 1.5, letterSpacing: 0),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+    FocusManager.instance.primaryFocus?.unfocus();
+    if (confirm != true) return;
+    if (mounted) setState(() => m.removing = true);
+    // let the 520ms _BurnFade dissolve finish before the row is pulled
+    await Future.delayed(const Duration(milliseconds: 560));
+    await db.deleteMessage(m.msgUid!);
+    if (mounted) setState(() => _messages.remove(m));
+    // the home row still previews the message just unsent
+    unawaited(appState.refreshContacts());
+    await _sendUnsendFrame(m.msgUid!);
+  }
+
+  Future<void> _togglePin(_Msg m) async {
+    if (m.msgUid == null) return;
+    if (!m.pinned) {
+      final count = (await db.pinnedIn(peerId: widget.peerHaloId)).length;
+      if (count >= kMaxPins) {
+        if (mounted) {
+          showHaloToast(context, l10n.chatThisChatHasPins(kMaxPins));
+        }
+        return;
+      }
+    }
+    if (!mounted) return;
+    final ok = await showConfirmSheet(
+      context,
+      title: m.pinned ? l10n.chatUnpinThisMessage : l10n.chatPinThisMessage,
+      line: m.pinned ? l10n.chatItLeavesThePinned : l10n.chatItGoesUnderThe,
+      yes: m.pinned ? l10n.chatUnpin : l10n.chatPinIt,
+      keep: l10n.chatNotNow,
+      rose: false,
+    );
+    if (!ok) return;
+    await _setPinned(m.msgUid!, !m.pinned);
+  }
+
+  // every jump to a message lands through here: a pin, a quoted reply, a
+  // saved message opened from outside. see row_anchor.dart.
+  final RowAnchors _anchors = RowAnchors();
+
+  void _scrollToMessage(_Msg m) => _landOn(_rowKey(m));
+
+  void _landOn(String rowKey) {
+    final at = _messages.lastIndexWhere((m) => _rowKey(m) == rowKey);
+    if (at < 0) return;
+    final uid = _messages[at].msgUid;
+    _jumpActive = true;
+    landOnRow(
+      ctrl: _scrollCtrl,
+      anchors: _anchors,
+      id: rowKey,
+      alive: () => mounted,
+      indexOf: (k) {
+        final i = _messages.lastIndexWhere((m) => _rowKey(m) == k);
+        return i < 0 ? null : i;
+      },
+      reversed: true,
+      rough: () {
+        final p = _scrollCtrl.positions.first;
+        final i = _messages.lastIndexWhere((m) => _rowKey(m) == rowKey);
+        final frac = (_messages.length - 1 - i) / _messages.length;
+        return frac * p.maxScrollExtent - p.viewportDimension * 0.5;
+      },
+      done: (landed) {
+        _jumpActive = false;
+        if (!mounted || !landed || uid == null) return;
+        setState(() => _rippleUid = uid);
+        Future.delayed(const Duration(milliseconds: 1300), () {
+          if (mounted && _rippleUid == uid) setState(() => _rippleUid = null);
+        });
+      },
+    );
+  }
+
+  // 12-char base36 id from a high-precision timestamp + random salt.
+  // collision-resistant enough for our scale.
+  String _newMsgUid() {
+    final t = DateTime.now().microsecondsSinceEpoch.toRadixString(36);
+    final r =
+        (DateTime.now().microsecondsSinceEpoch ^
+                identityHashCode(this) ^
+                _msgUidCounter++)
+            .abs()
+            .toRadixString(36);
+    return '${t.padLeft(8, '0').substring(0, 8)}${r.substring(0, 4).padLeft(4, '0')}';
+  }
+
+  int _msgUidCounter = 0;
+
+  // open an edit sheet for own message m. saves locally + tells the peer.
+  Future<void> _editMessage(_Msg m) async {
+    if (m.msgUid == null) {
+      final uid = _newMsgUid();
+      m.msgUid = uid;
+      await db.assignUidIfMissing(
+        widget.peerHaloId,
+        m.when.millisecondsSinceEpoch,
+        uid,
+      );
+    }
+    if (!mounted) return;
+    final ctrl = TextEditingController(text: m.text);
+    final result = await showHaloSheet<String>(
+      context,
+      scroll: true,
+      builder: (ctx) => Padding(
+        padding: EdgeInsets.only(
+          left: 20,
+          right: 20,
+          top: 20,
+          bottom: MediaQuery.of(ctx).viewInsets.bottom + 20,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const SheetHandle(),
+            Text(
+              l10n.chatEditMessage,
+              style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 20, fontWeight: FontWeight.w400, color: colors.accent, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+            ),
+            const SizedBox(height: 14),
+            TextField(
+              controller: ctrl,
+              autofocus: true,
+              maxLines: null,
+              cursorColor: colors.accent,
+              style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 15, fontWeight: FontWeight.w400, height: 1.5, letterSpacing: 0),
+              decoration: InputDecoration(
+                enabledBorder: UnderlineInputBorder(
+                  borderSide: BorderSide(color: colors.separatorStrong),
+                ),
+                focusedBorder: UnderlineInputBorder(
+                  borderSide: BorderSide(color: colors.accent),
+                ),
+              ),
+            ),
+            const SizedBox(height: 18),
+            Row(
+              children: [
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx),
+                  child: Text(
+                    l10n.commonCancel,
+                    style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+                  ),
+                ),
+                const Spacer(),
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx, ctrl.text),
+                  child: Text(
+                    l10n.commonSave,
+                    style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w500, color: colors.accent, height: 1.5, letterSpacing: 0),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+    ctrl.dispose();
+    if (result == null) return;
+    final newText = result.trim();
+    if (newText.isEmpty || newText == m.text) return;
+    setState(() {
+      m.text = newText;
+      m.edited = true;
+    });
+    await db.editMessage(m.msgUid!, newText);
+    // queued first, sent now: if the route is down the outbox carries it,
+    // the way it carries a message. the home row shows the new text too.
+    await db.queueEdit(m.msgUid!, widget.peerHaloId, newText);
+    unawaited(appState.refreshContacts());
+    unawaited(appState.sendEdit(widget.peerHaloId, m.msgUid!, newText));
+  }
+
+  // toggle a reaction on a message. tap same emoji again to remove.
+  // tap a different emoji to replace.
+  Future<void> _toggleReaction(_Msg m, String emoji) async {
+    if (m.msgUid == null) {
+      final uid = _newMsgUid();
+      m.msgUid = uid;
+      await db.assignUidIfMissing(
+        widget.peerHaloId,
+        m.when.millisecondsSinceEpoch,
+        uid,
+      );
+    }
+    final current = m.reactions[''];
+    final remove = current == emoji; // tapping same emoji = unreact
+    final newEmoji = remove ? '' : emoji;
+    setState(() {
+      if (remove) {
+        m.reactions.remove('');
+      } else {
+        m.reactions[''] = emoji;
+      }
+    });
+    if (remove) {
+      await db.removeReaction(m.msgUid!, '');
+    } else {
+      await db.addReaction(m.msgUid!, '', emoji);
+    }
+    // send to peer as a reaction control envelope (empty body).
+    try {
+      final wrapped = await wrapMessage(
+        '',
+        reaction: ReactionFrame(targetUid: m.msgUid!, emoji: newEmoji),
+      );
+      final cipher = await signalEncrypt(widget.peerHaloId, wrapped);
+      final useDirectOnion = !_backPaired || _peerXPub == null;
+      final f = useDirectOnion
+          ? Future(() => engine.sendTo(widget.peerOnion, cipher))
+          : Future(() => engine.nostrSend(_peerXPub!, cipher));
+      await f;
+    } catch (e) {
+      dlog('reaction send failed: $e');
+    }
+  }
+
+  final Set<String> _seenUids = <String>{};
+
+  Future<void> _loadMessages() async {
+    if (_loading) {
+      _reloadPending = true;
+      return;
+    }
+    _loading = true;
+    try {
+      await _loadMessagesInner();
+    } finally {
+      _loading = false;
+      if (_reloadPending && mounted) {
+        _reloadPending = false;
+        _loadMessages();
+      }
+    }
+  }
+
+  Future<void> _loadMessagesInner() async {
+    await db.purgeExpiredBurns();
+    db.isBackPaired(widget.peerHaloId).then((v) {
+      if (mounted) setState(() => _backPaired = v);
+    });
+    db.isBlocked(widget.peerHaloId).then((v) {
+      if (mounted) setState(() => _blocked = v);
+    });
+    db.isMuted(widget.peerHaloId).then((v) {
+      if (mounted) setState(() => _muted = v);
+    });
+    final wantAll = _searching || widget.jumpToUid != null || _pagedOut;
+    final rows = wantAll
+        ? await db.messagesFor(widget.peerHaloId)
+        : await db.messagesPage(widget.peerHaloId, limit: _pageSize + 1);
+    _hasMore = !wantAll && rows.length > _pageSize;
+    if (_hasMore) rows.removeAt(0);
+    if (wantAll) _hasMore = false;
+    if (!mounted) return;
+    // collect msg_uids first, batch-load reactions, then setState.
+    final loaded = <_Msg>[];
+    final uids = <String>[];
+    for (final r in rows) {
+      final uid = r['msg_uid'] as String?;
+      loaded.add(
+        _Msg(
+          r['direction'] as String,
+          r['plaintext'] as String,
+          DateTime.fromMillisecondsSinceEpoch(r['sent_at'] as int),
+          burnAt: r['burn_at'] as int?,
+          msgUid: uid,
+          replyTo: r['reply_to'] as String?,
+          secure: (r['secure'] as int? ?? 0) == 1,
+          edited: (r['edited'] as int? ?? 0) == 1,
+          pinned: (r['pinned'] as int? ?? 0) == 1,
+          mediaPath: r['media_path'] as String?,
+          filePath: r['file_path'] as String?,
+          fileName: r['file_name'] as String?,
+          voiceDisguised: (r['voice_disguised'] as int? ?? 0) == 1,
+          saved: (r['saved'] as int? ?? 0) == 1,
+          delivered: (r['delivered'] as int? ?? 0) == 1,
+          sending:
+              (r['direction'] as String) == 'out' &&
+              (r['sent'] as int? ?? 1) == 0,
+        ),
+      );
+      final pvRaw = r['preview'] as String?;
+      if (pvRaw != null && pvRaw.isNotEmpty) {
+        try {
+          final d = jsonDecode(pvRaw) as Map<String, dynamic>;
+          loaded.last.preview = d.map((k, v) => MapEntry(k, v.toString()));
+        } catch (_) {}
+      }
+      loaded.last.rowid = (r['rowid'] as int?) ?? 0;
+      if (uid != null) uids.add(uid);
+    }
+    final reactionMap = await db.loadReactionsFor(uids);
+    for (final m in loaded) {
+      if (m.msgUid == null) continue;
+      final entries = reactionMap[m.msgUid!];
+      if (entries == null) continue;
+      for (final e in entries) {
+        m.reactions[e.key] = e.value;
+      }
+    }
+    if (!mounted) return;
+    final newSeen = <String>{};
+    for (final m in loaded) {
+      if (m.msgUid != null) newSeen.add(m.msgUid!);
+    }
+    if (_loaded) {
+      for (final m in loaded) {
+        if (m.direction != 'out' &&
+            m.msgUid != null &&
+            !_seenUids.contains(m.msgUid)) {
+          m.fresh = true;
+        }
+      }
+    }
+    _seenUids
+      ..clear()
+      ..addAll(newSeen);
+    if (!_unreadResolved) {
+      _firstUnreadIndex = -1;
+      for (var i = 0; i < loaded.length; i++) {
+        if (loaded[i].direction != 'out' &&
+            loaded[i].when.millisecondsSinceEpoch > _unreadAfterMs) {
+          _firstUnreadIndex = i;
+          break;
+        }
+      }
+      _unreadResolved = true;
+    }
+    // a reloaded 'sending' row has no send future left to resolve it, so it
+    // becomes failed (or parked) and retryable
+    final staleCutoff = DateTime.now().subtract(const Duration(seconds: 60));
+    // while tor warms up a pending send is queued, not dead: the reconnect
+    // retry fires it. torReady rather than reachable, since an onion that
+    // will not publish never reaches 'reachable'.
+    final torUp = appState.torReady;
+    final backPaired = await db.isBackPaired(widget.peerHaloId);
+    for (final m in loaded) {
+      // under a minute old the send future may still be running. a file
+      // still going out is never stale: its row is saved before the first
+      // slice leaves, and a failed mark would make the retry send it twice.
+      if (m.msgUid != null && mediaInflight.contains(m.msgUid)) continue;
+      if (torUp &&
+          m.direction == 'out' &&
+          m.sending &&
+          m.when.isBefore(staleCutoff)) {
+        m.sending = false;
+        if (backPaired) {
+          m.failed = true;
+        } else {
+          m.parked = true;
+        }
+      }
+    }
+    // a reload rebuilds every row; the retry count rides across, or a
+    // failed send never reaches its cap
+    final carry = {
+      for (final m in _messages)
+        if (m.msgUid != null) m.msgUid!: (m.autoRetries, m.gaveUp),
+    };
+    for (final m in loaded) {
+      final c = carry[m.msgUid];
+      if (c != null) {
+        m.autoRetries = c.$1;
+        m.gaveUp = c.$2;
+      }
+    }
+    unawaited(_refreshPinCount());
+    setState(() {
+      _loaded = true;
+      _forgetDayKeys();
+      _messages
+        ..clear()
+        ..addAll(loaded);
+      _normaliseMessages();
+      if (loaded.isNotEmpty) {
+        final last = loaded.last.when;
+        _stickyDayMs = DateTime(
+          last.year,
+          last.month,
+          last.day,
+        ).millisecondsSinceEpoch;
+      }
+    });
+    // if a search is active, recompute matches against the fresh list.
+    if (_searching && _query.isNotEmpty) {
+      _onQueryChanged(_query);
+    } else if (!_didJump && widget.jumpToUid != null) {
+      _didJump = true;
+      _jumpToUid(widget.jumpToUid!);
+    } else {
+      _scrollToEnd(instant: true);
+    }
+  }
+
+  bool _didJump = false;
+  bool _wasReachable = false;
+  bool _jumpActive = false;
+
+  // scroll a specific message into view and pulse it, for jump-from-saved.
+  void _jumpToUid(String uid) {
+    final idx = _messages.indexWhere((m) => m.msgUid == uid);
+    if (idx < 0) {
+      _jumpActive = false;
+      _scrollToEnd();
+      return;
+    }
+    _landOn(_rowKey(_messages[idx]));
+  }
+
+  // hasClients is not enough: the controller attaches before layout, and a
+  // jump then reads a null minScrollExtent. .position asserts one attached
+  // view, and a route transition can attach two, so .positions it is.
+  bool get _scrollReady =>
+      _scrollCtrl.positions.length == 1 &&
+      _scrollCtrl.positions.first.hasContentDimensions;
+
+  void _safeJump(double to) {
+    if (_scrollReady) _scrollCtrl.jumpTo(to);
+  }
+
+  void _scrollToEnd({bool instant = false}) {
+    if (_jumpActive) return;
+    // reversed list: the newest message lives at offset 0
+    if (!_scrollCtrl.hasClients) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _scrollReady) _scrollCtrl.jumpTo(0);
+      });
+      return;
+    }
+    if (instant) {
+      _safeJump(0);
+    } else {
+      if (!_scrollReady) return;
+      _scrollCtrl.animateTo(
+        0,
+        duration: const UmbraMotion.durationNormal,
+        curve: UmbraMotion.easeOut,
+      );
+    }
+  }
+
+  // the receiver in main.dart owns the engine inbox and routes every message
+  // through _applyIncomingPayload. this only pulls new rows from the db.
+  Future<void> _checkInbox() async {
+    if (!_loaded || _searching) return;
+    // cheap tick: only rows newer than our newest. never a full reload here,
+    // once a second that blinks the list and snaps the scroll.
+    final lastRowid = _messages.isEmpty
+        ? 0
+        : _messages.map((m) => m.rowid).reduce((a, b) => a > b ? a : b);
+    final rows = await db.messagesAfter(widget.peerHaloId, lastRowid);
+    if (!mounted || rows.isEmpty) return;
+    final have = _messages.map((m) => m.msgUid).toSet();
+    final brandNew = rows
+        .where(
+          (r) =>
+              (r['msg_uid'] as String?) != null &&
+              !have.contains(r['msg_uid'] as String?),
+        )
+        .toList();
+    if (brandNew.isEmpty) return;
+    // new rows: the append path builds them
+    await _tryAppendNew();
+  }
+
+  Future<void> _retry(_Msg msg) async {
+    if (_sending) return;
+    setState(() {
+      msg.failed = false;
+      msg.sending = true;
+      _status = '';
+    });
+    // a stranger's opener rides its nonce again, or the far side's gate
+    // drops the retry
+    final nonce = msg.msgUid == null ? null : await db.powNonceOf(msg.msgUid!);
+    final String cipher;
+    try {
+      final wrapped = await wrapMessage(
+        msg.text,
+        msgUid: msg.msgUid,
+        powNonce: nonce,
+        powBitsUsed: nonce == null ? null : powBits,
+        replyTo: msg.replyTo,
+        burnSeconds: msg.burnSecs,
+        preview: msg.preview,
+        secure: msg.secure,
+        supporterBadge: await appState.sharedBadge(),
+        sender: SenderInfo(
+          haloId: appState.myId,
+          edPub: engine.myEdPubkey(),
+          onion: appState.myOnion,
+          xPub: engine.myXPubkey(),
+        ),
+      );
+      cipher = await signalEncrypt(widget.peerHaloId, wrapped);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        msg.sending = false;
+        msg.failed = true;
+      });
+      return;
+    }
+    // before the peer back-pairs, direct onion first so their drain runs the
+    // back-pair flow: they don't follow our xpub on nostr yet. on failure,
+    // fall back to nostr store-and-forward.
+    final sendFuture = Future<String>(() async {
+      var torWait = 0;
+      while (!_torReadyToSend() && torWait < 300000) {
+        await Future.delayed(const UmbraMotion.durationSlow);
+        torWait += 400;
+      }
+      if (!_torReadyToSend()) return 'error: tor not ready';
+      String? tor;
+      if (!_backPaired && widget.peerOnion.isNotEmpty) {
+        tor = await Future(() => engine.sendTo(widget.peerOnion, cipher));
+        if (tor == 'ok') return 'ok';
+        dlog('chat send: tor direct failed ($tor), trying nostr');
+      }
+      // the xpub may be null on a fresh back-pair or reconnect. re-fetch it
+      // from the session before giving up on the relay route.
+      var xpub = _peerXPub;
+      xpub ??= widget.peerXPub.isEmpty ? null : widget.peerXPub;
+      xpub ??= await signalSession.peerXPubHex(widget.peerHaloId);
+      if (xpub != null) {
+        _peerXPub = xpub;
+        // before they back-pair, the pair address is one they cannot
+        // derive yet. their first-contact address is the only relay
+        // route that reaches them.
+        final fcPk = appState.peerFcFor(widget.peerHaloId);
+        if (!_backPaired && fcPk != null && fcPk.isNotEmpty) {
+          final fr = await engine.sendFirstContact(xpub, fcPk, cipher);
+          if (fr == 'ok') return 'ok';
+          dlog('chat send: first-contact failed ($fr)');
+        }
+        final r = await Future(() => engine.nostrSend(xpub!, cipher));
+        // the pair address is a drop box they read only once they add us
+        // back. stored there is not delivered.
+        if (r == 'ok' && !_backPaired) return 'parked';
+        return r;
+      }
+      return tor ?? 'error: no transport';
+    });
+    sendFuture.then((result) async {
+      if (result == 'ok' && msg.msgUid != null) {
+        await db.markSent(msg.msgUid!);
+      }
+      if (result == 'ok' && msg.burnSecs != null && msg.msgUid != null) {
+        final ba = DateTime.now().millisecondsSinceEpoch + msg.burnSecs! * 1000;
+        await db.setMsgBurnAt(msg.msgUid!, ba);
+        msg.burnAt = ba;
+      }
+      if (!mounted) return;
+      if (result == 'ok') {
+        setState(() {
+          msg.sending = false;
+          msg.parked = false;
+          if (msg.burnSecs != null) {
+            msg.burnAt =
+                DateTime.now().millisecondsSinceEpoch + msg.burnSecs! * 1000;
+          }
+        });
+      } else if (result == 'parked') {
+        setState(() {
+          msg.sending = false;
+          msg.parked = true;
+        });
+      } else {
+        setState(() {
+          msg.sending = false;
+          msg.failed = true;
+          _status = result;
+        });
+      }
+    });
+  }
+
+  void _pickBurnDuration() {
+    final options = <int, String>{
+      30: l10n.chat30Seconds,
+      60: l10n.chat1Minute,
+      300: l10n.chat5Minutes,
+      3600: l10n.chat1Hour,
+      86400: l10n.chat24Hours,
+    };
+    showHaloSheet<void>(
+      context,
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 18, 20, 12),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const SheetHandle(),
+              Row(
+                children: [
+                  Icon(
+                    Icons.local_fire_department_outlined,
+                    size: 14,
+                    color: colors.accent,
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    l10n.chatGhostTimer,
+                    style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 16, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 4),
+              Text(
+                l10n.chatHowLongBeforeSent,
+                style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.12),
+              ),
+              const SizedBox(height: 12),
+              ...options.entries.map((e) {
+                final isSelected = _burnSeconds == e.key;
+                return InkWell(
+                  onTap: () {
+                    setState(() {
+                      _burnSeconds = e.key;
+                      _ghost = true;
+                      _lastBurnSeconds = e.key;
+                      _lastGhost = true;
+                      appState.saveGhostPref(true, e.key);
+                    });
+                    Navigator.of(ctx).pop();
+                  },
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            e.value,
+                            style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w400, color: isSelected
+                                  ? colors.accent
+                                  : colors.textPrimary, height: 1.5, letterSpacing: 0),
+                          ),
+                        ),
+                        if (isSelected)
+                          Icon(
+                            Icons.check_rounded,
+                            size: 16,
+                            color: colors.accent,
+                          ),
+                      ],
+                    ),
+                  ),
+                );
+              }),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // a one-shot amber ring on a bubble when a reaction lands on it
+  void _flashReaction(_Msg msg) {
+    HapticFeedback.selectionClick();
+    if (msg.msgUid == null) return;
+    setState(() => _rippleUid = msg.msgUid);
+    Future.delayed(const Duration(milliseconds: 650), () {
+      if (!mounted) return;
+      if (_rippleUid == msg.msgUid) setState(() => _rippleUid = null);
+    });
+  }
+
+  // a retry has nothing to do for a file that went, or is going. a reload
+  // can paint a row failed from a stale read, and sending on that alone
+  // puts the same file on the wire twice.
+  Future<bool> _alreadyGoing(_Msg msg) async {
+    final uid = msg.msgUid;
+    if (uid == null) return false;
+    if (mediaInflight.contains(uid)) {
+      if (mounted) {
+        setState(() {
+          msg.failed = false;
+          msg.sending = true;
+        });
+      }
+      return true;
+    }
+    if (await db.isSent(uid)) {
+      if (mounted) {
+        setState(() {
+          msg.failed = false;
+          msg.sending = false;
+        });
+      }
+      return true;
+    }
+    return false;
+  }
+
+  // resend a failed image from the saved file
+  Future<void> _retryImage(_Msg msg) async {
+    final path = msg.mediaPath;
+    if (path == null) return;
+    if (await _alreadyGoing(msg)) return;
+    final file = File(path);
+    if (!await file.exists()) {
+      setState(() => msg.failed = true);
+      return;
+    }
+    setState(() {
+      msg.failed = false;
+      msg.sending = true;
+    });
+    final msgUid = msg.msgUid ?? _newMsgUid();
+    msg.msgUid = msgUid;
+    _sendChunkedMedia(
+      path: path,
+      msgUid: msgUid,
+      caption: msg.text,
+      burnSeconds: msg.burnSecs,
+      secure: msg.secure,
+    ).then((result) => _finishMediaSend(msg, result));
+  }
+
+  // a failed voice note or file, the same way
+  Future<void> _retryMedia(_Msg msg) async {
+    final path = msg.filePath;
+    if (path == null || msg.fileName == null) return;
+    if (await _alreadyGoing(msg)) return;
+    final file = File(path);
+    if (!await file.exists()) {
+      setState(() => msg.failed = true);
+      return;
+    }
+    setState(() {
+      msg.failed = false;
+      msg.sending = true;
+    });
+    final msgUid = msg.msgUid ?? _newMsgUid();
+    msg.msgUid = msgUid;
+    _sendChunkedMedia(
+      path: path,
+      msgUid: msgUid,
+      fileName: msg.fileName!,
+      voice: msg.fileName == 'voice.wav',
+      voiceDisguised: msg.voiceDisguised,
+      burnSeconds: msg.burnSecs,
+    ).then((result) => _finishMediaSend(msg, result));
+  }
+
+  void _showAttachSheet() {
+    HapticFeedback.selectionClick();
+    showHaloSheet<void>(
+      context,
+      builder: (sheetCtx) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const SheetHandle(),
+              const SizedBox(height: 6),
+              ListTile(
+                leading: Icon(
+                  Icons.photo_camera_outlined,
+                  color: colors.accent,
+                  size: 22,
+                ),
+                title: Text(
+                  l10n.chatCamera,
+                  style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 15, fontWeight: FontWeight.w400, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+                ),
+                subtitle: Text(
+                  l10n.chatNoExifNeverSaved,
+                  style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.12),
+                ),
+                onTap: () {
+                  Navigator.of(sheetCtx).pop();
+                  _openCamera();
+                },
+              ),
+              ListTile(
+                leading: Icon(
+                  Icons.photo_library_outlined,
+                  color: colors.accent,
+                  size: 22,
+                ),
+                title: Text(
+                  l10n.chatGallery,
+                  style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 15, fontWeight: FontWeight.w400, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+                ),
+                onTap: () {
+                  Navigator.of(sheetCtx).pop();
+                  _pickAndSendMultiple();
+                },
+              ),
+              ListTile(
+                leading: Icon(
+                  Icons.videocam_outlined,
+                  color: colors.accent,
+                  size: 22,
+                ),
+                title: Text(
+                  l10n.chatVideo,
+                  style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 15, fontWeight: FontWeight.w400, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+                ),
+                onTap: () {
+                  Navigator.of(sheetCtx).pop();
+                  _pickAndSendVideo();
+                },
+              ),
+              ListTile(
+                leading: Icon(
+                  Icons.gif_box_outlined,
+                  color: colors.accent,
+                  size: 22,
+                ),
+                title: Text(
+                  l10n.chatGifFromPhone,
+                  style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 15, fontWeight: FontWeight.w400, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+                ),
+                onTap: () {
+                  Navigator.of(sheetCtx).pop();
+                  _pickAndSendGif();
+                },
+              ),
+              ListTile(
+                leading: Icon(
+                  Icons.attach_file,
+                  color: colors.accent,
+                  size: 22,
+                ),
+                title: Text(
+                  l10n.chatFile2,
+                  style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 15, fontWeight: FontWeight.w400, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+                ),
+                onTap: () {
+                  Navigator.of(sheetCtx).pop();
+                  _pickAndSendFile();
+                },
+              ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  void _toggleDisguise() {
+    setState(() => _disguise = !_disguise);
+    appState.saveDisguisePref(_disguise);
+    HapticFeedback.selectionClick();
+  }
+
+  void _onVoiceComplete(String path, int ms, bool cancelled) {
+    if (path.isEmpty) return;
+    if (cancelled) {
+      // the raw recording, undisguised. nothing else will ever delete it.
+      File(path).delete().ignore();
+      return;
+    }
+    _sendVoice(path, ms);
+  }
+
+  Future<void> _sendVoice(String srcPath, int ms) async {
+    final src = File(srcPath);
+    if (_requestLocked) {
+      src.delete().ignore();
+      return;
+    }
+    if (!await src.exists()) return;
+    if (_requestPending) setState(() => _sentCount++);
+    var bytes = await src.readAsBytes();
+    // the recorder's own file is the voice before any disguise, so it goes
+    // now. the copy kept with the message is below.
+    src.delete().ignore();
+    if (_disguise) bytes = disguiseWav(bytes);
+    final msgUid = _newMsgUid();
+    final dir = await getApplicationDocumentsDirectory();
+    final mediaDir = Directory('${dir.path}/media');
+    if (!await mediaDir.exists()) await mediaDir.create(recursive: true);
+    final dest = File('${mediaDir.path}/vn_$msgUid.wav');
+    await dest.writeAsBytes(bytes);
+    final filePath = dest.path;
+    final msg = _Msg(
+      'out',
+      '',
+      DateTime.now(),
+      sending: true,
+      msgUid: msgUid,
+      filePath: filePath,
+      fileName: 'voice.wav',
+      voiceDisguised: _disguise,
+      burnSecs: _ghost ? _burnSeconds : null,
+      burnAt: null,
+    );
+    setState(() {
+      _messages.add(msg);
+      _normaliseMessages();
+      _status = '';
+    });
+    _scrollToEnd();
+    HapticFeedback.lightImpact();
+    await db.saveMessage(
+      widget.peerHaloId,
+      'out',
+      '',
+      msgUid: msgUid,
+      filePath: filePath,
+      fileName: 'voice.wav',
+      voiceDisguised: _disguise,
+      burnAt: msg.burnAt,
+      burnSecs: msg.burnSecs,
+      sent: 0,
+    );
+    _sendChunkedMedia(
+      path: filePath,
+      msgUid: msgUid,
+      fileName: 'voice.wav',
+      voice: true,
+      voiceDisguised: _disguise,
+      burnSeconds: _ghost ? _burnSeconds : null,
+    ).then((result) => _finishMediaSend(msg, result));
+  }
+
+  // rough wire time: 16k slices, base64 adds a third, five in flight at
+  // about two seconds a round over tor
+  String _wireEstimate(int bytes) {
+    final slices = ((bytes * 4 / 3) / (16 * 1024)).ceil();
+    final secs = ((slices / 5).ceil() * 2.2).round();
+    if (secs < 20) return l10n.chatAFewSeconds;
+    if (secs < 90) return l10n.chatUnderAMinute;
+    final mins = (secs / 60).round();
+    return l10n.chatRoughlyMin(mins);
+  }
+
+  String _humanBytes(int b) {
+    if (b < 1024) return l10n.chatB2(whole(b));
+    if (b < 1024 * 1024) return l10n.chatKb2(whole((b / 1024).round()));
+    return l10n.chatMb2(decimal((b / (1024 * 1024)), 1));
+  }
+
+  // anything big enough to be a wait gets a confirm first. small stuff goes
+  // straight out - a dialog on a 40kb photo would just be noise.
+  Future<bool> _confirmBigSend(int bytes) async {
+    if (bytes < 512 * 1024) return true;
+    if (!mounted) return false;
+    final ok = await showHaloSheet<bool>(
+      context,
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(22, 20, 22, 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const SheetHandle(),
+              Text(
+                l10n.chatSendThis,
+                style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 19, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.normal, height: 1.05, letterSpacing: -0.015),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                appState.sendMode == 'private'
+                    ? l10n.chatOverTor(_humanBytes(bytes), _wireEstimate(bytes))
+                    : _humanBytes(bytes),
+                style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 12, fontWeight: FontWeight.w500, color: colors.accent, letterSpacing: 0.12),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                l10n.chatBigFilesGoOut,
+                style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 12, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0).copyWith(height: 1.4),
+              ),
+              const SizedBox(height: 18),
+              Row(
+                children: [
+                  Expanded(
+                    child: GestureDetector(
+                      onTap: () => Navigator.pop(ctx, false),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(vertical: 13),
+                        alignment: Alignment.center,
+                        decoration: BoxDecoration(
+                          border: Border.all(color: colors.separator),
+                          borderRadius: BorderRadius.circular(11),
+                        ),
+                        child: Text(
+                          l10n.commonCancel,
+                          style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: GestureDetector(
+                      onTap: () => Navigator.pop(ctx, true),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(vertical: 13),
+                        alignment: Alignment.center,
+                        decoration: BoxDecoration(
+                          color: colors.accent,
+                          borderRadius: BorderRadius.circular(11),
+                        ),
+                        child: Text(
+                          l10n.chatSendIt,
+                          style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.accentOn, height: 1.5, letterSpacing: 0),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (mounted) FocusManager.instance.primaryFocus?.unfocus();
+    return ok == true;
+  }
+
+  // the picker hands back a path to its own copy, copied from there into the
+  // media folder, so no byte array crosses the plugin channel. withData
+  // keeps three copies in memory and gives null bytes on 32-bit phones.
+  Future<void> _pickAndSendFile() async {
+    final FilePickerResult? res;
+    try {
+      res = await lockState.hold(() => FilePicker.pickFiles());
+    } catch (e) {
+      // the picker could not copy what was chosen: a provider that will
+      // not hand the file over, a gone download. say so instead of nothing.
+      if (mounted) showHaloToast(context, l10n.chatCouldNotReadThat);
+      return;
+    }
+    if (res == null || res.files.isEmpty) return;
+    final path = res.files.first.path;
+    final name = res.files.first.name;
+    if (path != null) await _sendFileFrom(path, name);
+    await shredPicked(res);
+  }
+
+  // the in-app camera: a stripped photo goes through the caption screen like
+  // a picked one; a clip goes as a file and its private copy is shredded
+  // once it has been read
+  Future<void> _openCamera() async {
+    final r = await Navigator.of(
+      context,
+    ).push<CaptureResult>(haloRoute<CaptureResult>(const CameraScreen()));
+    if (r == null || !mounted) return;
+    if (r.photo != null) {
+      final caption = await Navigator.of(
+        context,
+      ).push<String?>(haloRoute<String?>(_ImageCaptionScreen(bytes: r.photo!)));
+      if (caption == null) return;
+      await _sendOneImage(r.photo!, caption);
+      return;
+    }
+    final path = r.videoPath;
+    if (path == null) return;
+    if (!mounted) return;
+    await _sendFileFrom(
+      path,
+      'clip_${DateTime.now().millisecondsSinceEpoch}.mp4',
+    );
+    await shredFile(path);
+  }
+
+  // src is a file this app can read: the picker's copy or a camera clip.
+  // it is copied into the media folder, never read into memory.
+  Future<void> _sendFileFrom(String src, String name) async {
+    if (_requestLocked) return;
+    final int size;
+    try {
+      size = await File(src).length();
+    } catch (_) {
+      if (mounted) showHaloToast(context, l10n.chatCouldNotReadThat);
+      return;
+    }
+    if (size > 8 * 1024 * 1024) {
+      if (mounted) showHaloToast(context, l10n.chatFileTooBig8);
+      return;
+    }
+    if (!await _confirmBigSend(size)) return;
+    // after the confirm, so a cancelled send does not spend one of the two
+    // slots a stranger gets
+    if (_requestPending) setState(() => _sentCount++);
+    final msgUid = _newMsgUid();
+    final dir = await getApplicationDocumentsDirectory();
+    final mediaDir = Directory('${dir.path}/media');
+    if (!await mediaDir.exists()) await mediaDir.create(recursive: true);
+    final safe = name.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+    final dest = File('${mediaDir.path}/f_${msgUid}_$safe');
+    await File(src).copy(dest.path);
+    // a gallery video carries where, on what and when, like a photo. it is
+    // stripped in place on our own copy, and one that cannot be walked is
+    // not sent.
+    if (videoNameNeedsStrip(name)) {
+      final ok = await stripMp4Metadata(dest.path);
+      final left = ok == null ? null : await mp4MetadataCount(dest.path);
+      if (ok == null || left != 0) {
+        try {
+          await dest.delete();
+        } catch (_) {}
+        if (mounted) showHaloToast(context, l10n.chatCouldNotCleanThat);
+        return;
+      }
+    }
+    // a picture sent as a file is cleaned like one sent as a photo. it is
+    // told by its bytes, not its name: jpeg, png, webp, heic, avif. one the
+    // app cannot read through is not sent; the photo button re-encodes and
+    // will take it.
+    else if (await stripPictureFileOffUi(dest.path) == null) {
+      try {
+        await dest.delete();
+      } catch (_) {}
+      if (mounted) {
+        showHaloToast(context, l10n.chatCouldNotCleanThatPictureSend);
+      }
+      return;
+    }
+    final filePath = dest.path;
+    final msg = _Msg(
+      'out',
+      '',
+      DateTime.now(),
+      sending: true,
+      msgUid: msgUid,
+      filePath: filePath,
+      fileName: name,
+      burnSecs: _ghost ? _burnSeconds : null,
+      burnAt: null,
+    );
+    setState(() {
+      _messages.add(msg);
+      _normaliseMessages();
+      _status = '';
+    });
+    _scrollToEnd();
+    HapticFeedback.lightImpact();
+    await db.saveMessage(
+      widget.peerHaloId,
+      'out',
+      '',
+      msgUid: msgUid,
+      filePath: filePath,
+      fileName: name,
+      burnAt: msg.burnAt,
+      burnSecs: msg.burnSecs,
+      sent: 0,
+    );
+    _sendChunkedMedia(
+      path: filePath,
+      msgUid: msgUid,
+      fileName: name,
+      burnSeconds: _ghost ? _burnSeconds : null,
+    ).then((result) => _finishMediaSend(msg, result));
+  }
+
+  // a 5s wav is ~200kb of base64, over every public relay's event cap, so
+  // all media goes in 16kb slices. fileName null means the image lane. the
+  // shared sender does the work; this hands it what the screen knows.
+  Future<String> _sendChunkedMedia({
+    required String path,
+    required String msgUid,
+    String caption = '',
+    String? fileName,
+    bool voice = false,
+    bool voiceDisguised = false,
+    int? burnSeconds,
+    bool secure = false,
+  }) async {
+    return sendChunkedMediaTo(
+      peerId: widget.peerHaloId,
+      peerOnion: widget.peerOnion,
+      peerXPub: _peerXPub ?? (widget.peerXPub.isEmpty ? null : widget.peerXPub),
+      backPaired: _backPaired,
+      needPow: _recvCount == 0 || !await hasSessionWith(widget.peerHaloId),
+      path: path,
+      msgUid: msgUid,
+      caption: caption,
+      fileName: fileName,
+      voice: voice,
+      voiceDisguised: voiceDisguised,
+      burnSeconds: burnSeconds,
+      secure: secure,
+      sender: SenderInfo(
+        haloId: appState.myId,
+        edPub: engine.myEdPubkey(),
+        onion: appState.myOnion,
+        xPub: engine.myXPubkey(),
+        avatar: appState.myAvatar,
+      ),
+    );
+  }
+
+  Future<void> _finishMediaSend(_Msg msg, String result) async {
+    // another sender already has this one; its verdict comes later. a
+    // cancelled one has no row left to finish.
+    if (result == 'busy' || result == 'cancelled') return;
+    if (msg.msgUid != null) mediaProgressEnd(msg.msgUid!);
+    if (result == 'ok' && msg.msgUid != null) await db.markSent(msg.msgUid!);
+    if (result == 'ok' && msg.burnSecs != null && msg.msgUid != null) {
+      final ba = DateTime.now().millisecondsSinceEpoch + msg.burnSecs! * 1000;
+      await db.setMsgBurnAt(msg.msgUid!, ba);
+      msg.burnAt = ba;
+    }
+    if (!mounted) {
+      // left and reopened while it uploaded: tell the screen showing it now
+      appState.chatChanged(widget.peerHaloId);
+      return;
+    }
+    // a reload since the send began left [msg] off screen and a new object
+    // in its place; the verdict goes to the one being drawn as well
+    final shown = _messages.where(
+      (m) => m.msgUid != null && m.msgUid == msg.msgUid,
+    );
+    setState(() {
+      for (final m in {msg, ...shown}) {
+        m.sending = false;
+        m.parked = result == 'parked';
+        m.failed = result != 'ok' && result != 'parked';
+      }
+      if (result != 'ok' && result != 'parked') _status = result;
+    });
+  }
+
+  Future<void> _pickAndSendGif() async {
+    final FilePickerResult? res;
+    try {
+      res = await lockState.hold(
+        () => FilePicker.pickFiles(
+          type: FileType.custom,
+          allowedExtensions: ['gif'],
+        ),
+      );
+    } catch (e) {
+      if (mounted) showHaloToast(context, l10n.chatCouldNotReadThat);
+      return;
+    }
+    if (res == null || res.files.isEmpty) return;
+    // read from the picker's copy: one copy of the bytes, not three
+    final path = res.files.first.path;
+    final data = path == null ? null : await File(path).readAsBytes();
+    await shredPicked(res);
+    if (data == null) return;
+    // a gif must not be re-encoded, that kills the animation, so it skips the
+    // resize path. capped to keep send time and memory sane over tor.
+    if (data.length > 8 * 1024 * 1024) {
+      if (mounted) showHaloToast(context, l10n.chatGifTooBig8);
+      return;
+    }
+    // raw, but not with what rode along: a gif's comment and xmp blocks
+    // go, its frames and its loop count stay. whatever was picked under
+    // the gif filter is cleaned as the kind of file its bytes say it is.
+    final clean = stripPictureBytes(data);
+    if (clean == null) {
+      if (mounted) showHaloToast(context, l10n.chatCouldNotCleanThatGif);
+      return;
+    }
+    // send raw through the image path - Image.memory animates gifs by the bytes,
+    // the .jpg filename doesn't matter.
+    await _sendOneImage(clean, '');
+  }
+
+  Future<void> _sendOneImage(Uint8List bytes, String caption) async {
+    // two of anything before they accept, photos included: the far side
+    // holds a third
+    if (_requestLocked) return;
+    if (_requestPending) setState(() => _sentCount++);
+    final msgUid = _newMsgUid();
+    final dir = await getApplicationDocumentsDirectory();
+    final mediaDir = Directory('${dir.path}/media');
+    if (!await mediaDir.exists()) await mediaDir.create(recursive: true);
+    final mediaFile = File('${mediaDir.path}/$msgUid.jpg');
+    await mediaFile.writeAsBytes(bytes);
+    final mediaPath = mediaFile.path;
+    // read it once - the toggle is cleared below and the save reads it after.
+    final wantSecure = _secureNext;
+    final msg = _Msg(
+      'out',
+      caption,
+      DateTime.now(),
+      sending: true,
+      msgUid: msgUid,
+      mediaPath: mediaPath,
+      burnSecs: _ghost ? _burnSeconds : null,
+      burnAt: null,
+      secure: wantSecure,
+    );
+    setState(() {
+      _messages.add(msg);
+      _normaliseMessages();
+      _status = '';
+    });
+    _scrollToEnd();
+    HapticFeedback.lightImpact();
+    await db.saveMessage(
+      widget.peerHaloId,
+      'out',
+      caption,
+      msgUid: msgUid,
+      mediaPath: mediaPath,
+      burnAt: msg.burnAt,
+      burnSecs: msg.burnSecs,
+      sent: 0,
+      secure: wantSecure,
+    );
+    if (wantSecure && mounted) setState(() => _secureNext = false);
+    unawaited(
+      _sendChunkedMedia(
+        path: mediaPath,
+        msgUid: msgUid,
+        caption: caption,
+        burnSeconds: _ghost ? _burnSeconds : null,
+        secure: wantSecure,
+      ).then((r) => _finishMediaSend(msg, r)),
+    );
+  }
+
+  // its own tile rather than a mixed picker: on android 12 and older the
+  // mixed one is the system file browser. the clip goes the file way, which
+  // strips it and copies it out of the picker's cache.
+  Future<void> _pickAndSendVideo() async {
+    final x = await lockState.hold(
+      () => ImagePicker().pickVideo(source: ImageSource.gallery),
+    );
+    if (x == null || !mounted) return;
+    await _sendFileFrom(x.path, x.name);
+    await shredPickedImages([x]);
+  }
+
+  Future<void> _pickAndSendMultiple() async {
+    final picked = await lockState.hold(
+      () => ImagePicker().pickMultiImage(
+        maxWidth: 1280,
+        maxHeight: 1280,
+        imageQuality: 70,
+      ),
+    );
+    if (picked.isEmpty) return;
+    // one photo picked: same preview + caption screen the camera path gets.
+    if (picked.length == 1) {
+      final bytes = await picked.first.readAsBytes();
+      await shredPickedImages(picked);
+      if (!mounted) return;
+      final caption = await Navigator.of(
+        context,
+      ).push<String?>(haloRoute<String?>(_ImageCaptionScreen(bytes: bytes)));
+      if (caption == null) return;
+      await _sendOneImage(bytes, caption);
+      return;
+    }
+    final bytesOf = [for (final x in picked) await x.readAsBytes()];
+    await shredPickedImages(picked);
+    for (final bytes in bytesOf) {
+      if (!mounted) return;
+      await _sendOneImage(bytes, '');
+    }
+  }
+
+  bool _torReadyToSend() {
+    // outside onion nothing is routed through tor, so there is nothing to
+    // wait for, and the relay still works where tor is blocked
+    if (appState.sendMode != 'private') return appState.online;
+    final s = appState.torStatus;
+    return s == TorStatus.bootstrapped ||
+        s == TorStatus.publishing ||
+        s == TorStatus.reachable;
+  }
+
+  // the sender side: a preview fetched over tor by this phone, waiting to
+  // ride inside the next message. null when nothing is attached
+  Map<String, String>? _pendingPreview;
+  bool _previewBusy = false;
+
+  bool get _torUp {
+    final s = appState.torStatus;
+    return s == TorStatus.bootstrapped ||
+        s == TorStatus.publishing ||
+        s == TorStatus.reachable;
+  }
+
+  Future<void> _addPreview() async {
+    final url = firstUrl(_msgCtrl.text);
+    if (url == null || _previewBusy) return;
+    setState(() => _previewBusy = true);
+    try {
+      final html = await torStrictGetOnIsolate(url);
+      final title = html.startsWith('error:') ? null : titleFromHtml(html);
+      if (!mounted) return;
+      if (title == null || title.trim().isEmpty) {
+        // three different failures, said apart: tor itself, the site, or a
+        // page that has no title to give
+        showHaloToast(
+          context,
+          html.startsWith('error: tor')
+              ? l10n.chatTorIsNotUp
+              : html.startsWith('error:')
+              ? l10n.chatCouldnTReachIt
+              : l10n.chatNoTitleCameBack,
+        );
+        return;
+      }
+      HapticFeedback.selectionClick();
+      setState(() => _pendingPreview = senderPreview(url, title));
+    } catch (_) {
+      if (mounted) {
+        showHaloToast(context, l10n.chatCouldnTFetchIt);
+      }
+    } finally {
+      if (mounted) setState(() => _previewBusy = false);
+    }
+  }
+
+  Future<void> _send() async {
+    final text = _msgCtrl.text.trim();
+    if (text.isEmpty || _sending) return;
+    // a stranger gets 2 messages, then the chat locks until they accept. the
+    // input bar shows it; this guards the send itself.
+    if (_requestLocked) return;
+    final msgUid = _newMsgUid();
+    final replyToUid = _replyTo?.msgUid;
+    // a pending preview only belongs to a message that still holds its link
+    final url = firstUrl(text);
+    final preview = url != null && _pendingPreview?['url'] == url
+        ? _pendingPreview
+        : null;
+    final msg = _Msg(
+      'out',
+      text,
+      DateTime.now(),
+      sending: true,
+      msgUid: msgUid,
+      replyTo: replyToUid,
+      burnSecs: _ghost ? _burnSeconds : null,
+      burnAt: null,
+    );
+    msg.preview = preview;
+    setState(() {
+      _messages.add(msg);
+      _normaliseMessages();
+      _sending = true;
+      _status = '';
+      _replyTo = null;
+      _pendingPreview = null;
+    });
+    _msgCtrl.clear();
+    _scrollToEnd();
+    HapticFeedback.lightImpact();
+
+    try {
+      await db.saveMessage(
+        widget.peerHaloId,
+        'out',
+        text,
+        burnAt: msg.burnAt,
+        burnSecs: msg.burnSecs,
+        msgUid: msgUid,
+        replyTo: replyToUid,
+        sent: 0,
+        preview: preview == null ? null : jsonEncode(preview),
+      );
+    } catch (e) {
+      // a throw must not leave _sending true: that disables the composer
+      // and the auto retry until the chat is reopened
+      dlog('send: save failed: $e');
+      if (!mounted) return;
+      setState(() {
+        msg.sending = false;
+        msg.failed = true;
+        _sending = false;
+      });
+      return;
+    }
+    // the home row moves up on what you sent too, not only on what arrived
+    unawaited(appState.refreshContacts());
+    // first-contact proof of work, ground off the ui thread: until they have
+    // written to us their gate sees a stranger. the seed is the raw text, as
+    // the receiver's verifyPow expects.
+    int? powNonce;
+    final String cipher;
+    try {
+      // a fresh session is an opener whatever the history: the far side
+      // may have let us go and its gate asks again
+      final fresh = !await hasSessionWith(widget.peerHaloId);
+      if (_recvCount == 0 || fresh) {
+        powBusy.value = DateTime.now();
+        final int n;
+        try {
+          n = await compute(_grindPowTask, text);
+        } finally {
+          powBusy.value = null;
+        }
+        powNonce = n;
+        // kept on the row so a retry from the outbox carries the same nonce
+        await db.setPowNonce(msgUid, n);
+      }
+      final wrapped = await wrapMessage(
+        text,
+        powNonce: powNonce,
+        powBitsUsed: powNonce == null ? null : powBits,
+        burnSeconds: _ghost ? _burnSeconds : null,
+        msgUid: msgUid,
+        replyTo: replyToUid,
+        preview: preview,
+        supporterBadge: await appState.sharedBadge(),
+        sender: SenderInfo(
+          haloId: appState.myId,
+          edPub: engine.myEdPubkey(),
+          onion: appState.myOnion,
+          xPub: engine.myXPubkey(),
+        ),
+      );
+      final prev = _encryptGate;
+      final gate = Completer<void>();
+      _encryptGate = gate.future;
+      try {
+        await prev;
+        cipher = await signalEncryptSerial(widget.peerHaloId, wrapped);
+      } finally {
+        gate.complete();
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        msg.sending = false;
+        msg.failed = true;
+        _sending = false;
+        _status = l10n.chatNoSignalSessionRe;
+      });
+      return;
+    }
+    // fire and forget: a failure marks the row for retry
+    setState(() {
+      _sending = false;
+      _status = '';
+      if (_requestPending) _sentCount++;
+    });
+    // before the peer back-pairs, direct onion first so their drain runs the
+    // back-pair flow: they don't follow our xpub on nostr yet. on failure,
+    // fall back to nostr store-and-forward.
+    final sendFuture = Future<String>(() async {
+      var torWait = 0;
+      while (!_torReadyToSend() && torWait < 300000) {
+        await Future.delayed(const UmbraMotion.durationSlow);
+        torWait += 400;
+      }
+      if (!_torReadyToSend()) return 'error: tor not ready';
+      String? tor;
+      if (!_backPaired && widget.peerOnion.isNotEmpty) {
+        tor = await Future(() => engine.sendTo(widget.peerOnion, cipher));
+        if (tor == 'ok') return 'ok';
+        dlog('chat send: tor direct failed ($tor), trying nostr');
+      }
+      // the xpub may be null on a fresh back-pair or reconnect. re-fetch it
+      // from the session before giving up on the relay route.
+      var xpub = _peerXPub;
+      xpub ??= widget.peerXPub.isEmpty ? null : widget.peerXPub;
+      xpub ??= await signalSession.peerXPubHex(widget.peerHaloId);
+      if (xpub != null) {
+        _peerXPub = xpub;
+        // before they back-pair, the pair address is one they cannot
+        // derive yet. their first-contact address is the only relay
+        // route that reaches them.
+        final fcPk = appState.peerFcFor(widget.peerHaloId);
+        if (!_backPaired && fcPk != null && fcPk.isNotEmpty) {
+          final fr = await engine.sendFirstContact(xpub, fcPk, cipher);
+          if (fr == 'ok') return 'ok';
+          dlog('chat send: first-contact failed ($fr)');
+        }
+        final r = await Future(() => engine.nostrSend(xpub!, cipher));
+        // the pair address is a drop box they read only once they add us
+        // back. stored there is not delivered.
+        if (r == 'ok' && !_backPaired) return 'parked';
+        return r;
+      }
+      return tor ?? 'error: no transport';
+    });
+    sendFuture.then((result) async {
+      if (result == 'ok' && msg.msgUid != null) {
+        await db.markSent(msg.msgUid!);
+      }
+      if (result == 'ok' && msg.burnSecs != null && msg.msgUid != null) {
+        final ba = DateTime.now().millisecondsSinceEpoch + msg.burnSecs! * 1000;
+        await db.setMsgBurnAt(msg.msgUid!, ba);
+        msg.burnAt = ba;
+      }
+      if (!mounted) return;
+      if (result == 'ok') {
+        setState(() {
+          msg.sending = false;
+          msg.parked = false;
+          if (msg.burnSecs != null) {
+            msg.burnAt =
+                DateTime.now().millisecondsSinceEpoch + msg.burnSecs! * 1000;
+          }
+        });
+        if (msg.burnAt != null) {
+          await db.setMsgBurnAt(msgUid, msg.burnAt!);
+        }
+      } else if (result == 'parked') {
+        setState(() {
+          msg.sending = false;
+          msg.parked = true;
+        });
+      } else {
+        setState(() {
+          msg.sending = false;
+          msg.failed = true;
+          _status = result;
+        });
+      }
+    });
+  }
+
+  @override
+  void didChangeMetrics() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_scrollReady) return;
+      if (MediaQuery.of(context).viewInsets.bottom > 0) {
+        // reversed list: bottom (newest) is offset 0.
+        _scrollCtrl.animateTo(
+          0,
+          duration: const Duration(milliseconds: 220),
+          curve: UmbraMotion.easeOut,
+        );
+      }
+    });
+  }
+
+  // the lock lifted with this chat on top: it is the one being read again,
+  // so its messages are not counted unread and a tap on one of its
+  // notifications does not open a second copy of it
+  void _lockLifted() {
+    if (!mounted || !lockState.loaded || lockState.locked) return;
+    // inactive too: a fingerprint unlock lifts it under the system prompt
+    final life = WidgetsBinding.instance.lifecycleState;
+    if (life != AppLifecycleState.resumed &&
+        life != AppLifecycleState.inactive) {
+      return;
+    }
+    if (!(ModalRoute.of(context)?.isCurrent ?? false)) return;
+    if (currentChatPeer == widget.peerHaloId) return;
+    currentChatPeer = widget.peerHaloId;
+    db.clearUnread(widget.peerHaloId).then((_) => appState.refreshContacts());
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // out of the app this chat is not being read, so incoming messages must
+    // light the unread dot. leaving to home does not dispose the chat.
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.inactive) {
+      if (currentChatPeer == widget.peerHaloId) currentChatPeer = null;
+    } else if (state == AppLifecycleState.resumed) {
+      // only re-claim "this chat is open" as the visible route, or a
+      // backed-out chat stays open for good and its unread dot never lights
+      final visible = ModalRoute.of(context)?.isCurrent ?? false;
+      if (!visible) {
+        if (currentChatPeer == widget.peerHaloId) currentChatPeer = null;
+        return;
+      }
+      currentChatPeer = widget.peerHaloId;
+      db.clearUnread(widget.peerHaloId).then((_) => appState.refreshContacts());
+      _reconcileSending();
+    }
+  }
+
+  // a send that finished while we were backgrounded may have marked the db
+  // sent without clearing the in-memory spinner (the !mounted guard skips the
+  // setState). on resume, sync stuck spinners back from the db.
+  Future<void> _reconcileSending() async {
+    final stuck = _messages
+        .where((m) => m.direction == 'out' && m.sending && m.msgUid != null)
+        .toList();
+    if (stuck.isEmpty) return;
+    var changed = false;
+    for (final m in stuck) {
+      if (await db.isSent(m.msgUid!)) {
+        m.sending = false;
+        changed = true;
+      }
+    }
+    if (changed && mounted) setState(() {});
+  }
+
+  @override
+  void deactivate() {
+    // popped or covered: stop claiming this chat is the one being read, so a
+    // message arriving right after we leave still lights the home dot.
+    if (currentChatPeer == widget.peerHaloId) currentChatPeer = null;
+    super.deactivate();
+  }
+
+  static String _rowKey(_Msg m) => m.msgUid ?? 'r${m.rowid}';
+
+  // where a row went when the list under it changed, so its state follows
+  // the message and not the slot
+  int? _indexOfRow(Key key) {
+    if (key is! ValueKey<String>) return null;
+    final ix = _messages.lastIndexWhere((m) => _rowKey(m) == key.value);
+    return ix < 0 ? null : _messages.length - 1 - ix;
+  }
+
+  Widget _buildRow(BuildContext c, int i, bool searchActive) {
+    final ix = _messages.length - 1 - i;
+    final m = _messages[ix];
+    // an empty control message that leaked through would be a blank bubble
+    if (m.text.isEmpty &&
+        m.mediaPath == null &&
+        m.filePath == null &&
+        m.preview == null) {
+      return const SizedBox.shrink();
+    }
+    String? quoted;
+    String? quotedAuthor;
+    if (m.replyTo != null) {
+      final original = _byUid[m.replyTo];
+      if (original == null) {
+        quoted = l10n.chatMessageUnavailable;
+      } else {
+        quotedAuthor = original.direction == 'out'
+            ? l10n.chatYou2
+            : l10n.chatThem;
+        if (original.text.isNotEmpty) {
+          quoted = original.text;
+        } else if (original.mediaPath != null) {
+          quoted = l10n.chatQuotedPhoto;
+        } else if (original.fileName == 'voice.wav') {
+          quoted = l10n.chatVoiceMessage;
+        } else if (original.fileName != null) {
+          quoted = original.fileName;
+        } else {
+          quoted = l10n.chatMessageUnavailable;
+          quotedAuthor = null;
+        }
+      }
+    }
+    final isMatch = searchActive && _matchSet.contains(ix);
+    final isCurrent =
+        searchActive && _matches.isNotEmpty && _matches[_matchPos] == ix;
+    final dimmed = searchActive && !isMatch;
+    final showDate = ix == 0 || !_sameDay(_messages[ix - 1].when, m.when);
+    final prevMsg = ix > 0 ? _messages[ix - 1] : null;
+    final nextMsg = ix < _messages.length - 1 ? _messages[ix + 1] : null;
+    bool sameRun(_Msg? o) =>
+        o != null &&
+        o.direction == m.direction &&
+        !o.removing &&
+        _sameDay(o.when, m.when) &&
+        (m.when.difference(o.when).inSeconds).abs() < 120;
+    final firstInGroup = !sameRun(prevMsg) || ix == _firstUnreadIndex;
+    final lastInGroup = !sameRun(nextMsg);
+    return RepaintBoundary(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          if (showDate) _dateDivider(m.when, m.msgUid ?? 'r${m.rowid}'),
+          if (ix == _firstUnreadIndex) _newMessagesDivider(),
+          TweenAnimationBuilder<double>(
+            tween: Tween(begin: 1.0, end: m.removing ? 0.0 : 1.0),
+            duration: const Duration(milliseconds: 280),
+            curve: UmbraMotion.easeOut,
+            child: SwipeToReply(
+              onReply: () {
+                HapticFeedback.selectionClick();
+                setState(() {
+                  _replyTo = m;
+                  _replyFlash = m;
+                });
+                Future.delayed(const Duration(milliseconds: 700), () {
+                  if (mounted && identical(_replyFlash, m)) {
+                    setState(() => _replyFlash = null);
+                  }
+                });
+              },
+              child: SizedBox(
+                width: double.infinity,
+                child: AnimatedScale(
+                  scale: m.removing ? 0.92 : 1.0,
+                  duration: const UmbraMotion.durationSlow,
+                  curve: UmbraMotion.easeSharp,
+                  child: AnimatedOpacity(
+                    opacity:
+                        (m.removing ||
+                            (m.msgUid != null && m.msgUid == _liftedUid))
+                        ? 0.0
+                        : 1.0,
+                    duration: const UmbraMotion.durationSlow,
+                    child: _Bubble(
+                      key: isMatch ? _matchKeys[i] : null,
+                      msg: m,
+                      linkTitle: m.preview?['title'],
+                      linkBySender: m.preview?['by'] == 'sender',
+                      firstInGroup: firstInGroup,
+                      lastInGroup: lastInGroup,
+                      revealed: m.msgUid != null && m.msgUid == _revealedUid,
+                      onReveal: m.msgUid == null
+                          ? null
+                          : () => setState(
+                              () => _revealedUid = _revealedUid == m.msgUid
+                                  ? null
+                                  : m.msgUid,
+                            ),
+                      onRetry: (m) {
+                        m.autoRetries = 0;
+                        m.gaveUp = false;
+                        _retryAny(m);
+                      },
+                      onLongPress: (ctx) => _showEmojiPickerAt(ctx, m),
+                      secure: m.secure,
+                      quotedText: quoted,
+                      onQuoteTap: m.replyTo == null
+                          ? null
+                          : () {
+                              for (final x in _messages) {
+                                if (x.msgUid != null && x.msgUid == m.replyTo) {
+                                  _scrollToMessage(x);
+                                  break;
+                                }
+                              }
+                            },
+                      quotedAuthor: quotedAuthor,
+                      query: searchActive ? _query : '',
+                      isCurrentMatch: isCurrent,
+                      dimmed: dimmed,
+                      ripple:
+                          m.msgUid != null &&
+                          (m.msgUid == _rippleUid || identical(m, _replyFlash)),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            builder: (_, f, child) => ClipRect(
+              child: Align(
+                alignment: Alignment.topCenter,
+                heightFactor: f,
+                child: child,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // nothing to do: protection lives in the viewer, so a marked photo is
+  // covered and the chat around it stays usable
+  void _applySecureContent() {}
+
+  @override
+  void dispose() {
+    _pollTimer?.cancel();
+    _autoRetryTimer?.cancel();
+    _burnTick?.cancel();
+    if (currentChatPeer == widget.peerHaloId) currentChatPeer = null;
+    lockState.removeListener(_lockLifted);
+    appState.removeListener(_onAppStateChanged);
+    _lastReadPerPeer[widget.peerHaloId] = _messages.isNotEmpty
+        ? _messages.last.when.millisecondsSinceEpoch
+        : 0;
+    final draft = _msgCtrl.text;
+    if (draft.trim().isEmpty) {
+      _draftPerPeer.remove(widget.peerHaloId);
+    } else {
+      _draftPerPeer[widget.peerHaloId] = draft;
+    }
+    _msgCtrl.dispose();
+    _searchCtrl.dispose();
+    _stickyHideTimer?.cancel();
+    _scrollCtrl.removeListener(_onScroll);
+    _scrollCtrl.removeListener(_updateSticky);
+    _stickyLabel.dispose();
+    _stickyShown.dispose();
+    _scrollCtrl.dispose();
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  Future<void> _openMediaGallery() async {
+    final rows = await db.messagesFor(widget.peerHaloId);
+    final paths = <String>[];
+    final securePaths = <String>{};
+    for (final r in rows) {
+      final mp = r['media_path'] as String?;
+      if (mp != null && mp.isNotEmpty && await File(mp).exists()) {
+        paths.add(mp);
+        if ((r['secure'] as int? ?? 0) == 1) securePaths.add(mp);
+      }
+    }
+    if (!mounted) return;
+    Navigator.of(context).push(
+      haloRoute(
+        MediaGalleryScreen(
+          paths: paths.reversed.toList(),
+          securePaths: securePaths,
+          title: _nickname ?? widget.peerHaloId,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _chatActions() async {
+    final contact = await db.getContact(widget.peerHaloId);
+    final pinned = (contact?['pinned'] as int? ?? 0) == 1;
+    if (!mounted) return;
+    final action = await showHaloSheet<String>(
+      context,
+      scroll: true,
+      builder: (ctx) => SafeArea(
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: staggerAll([
+              const SheetHandle(),
+              // the person themselves: name, verification, vouches, media
+              InkWell(
+                onTap: () => Navigator.pop(ctx, 'contact'),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 20,
+                    vertical: 16,
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(
+                        Icons.person_outline,
+                        size: 18,
+                        color: colors.accent,
+                      ),
+                      const SizedBox(width: 14),
+                      Text(
+                        l10n.chatViewContact,
+                        style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w400, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              _IntroduceRow(
+                enabled: _accepted,
+                onTap: () => Navigator.pop(ctx, 'introduce'),
+              ),
+              InkWell(
+                onTap: () => Navigator.pop(ctx, 'photos'),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 20,
+                    vertical: 16,
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(
+                        Icons.photo_library_outlined,
+                        size: 18,
+                        color: colors.textSecondary,
+                      ),
+                      const SizedBox(width: 14),
+                      Text(
+                        l10n.chatSharedPhotos,
+                        style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w400, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              InkWell(
+                onTap: () => Navigator.pop(ctx, 'mute'),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 20,
+                    vertical: 16,
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(
+                        _muted
+                            ? Icons.notifications_active_outlined
+                            : Icons.notifications_off_outlined,
+                        size: 18,
+                        color: colors.textSecondary,
+                      ),
+                      const SizedBox(width: 14),
+                      Text(
+                        _muted
+                            ? l10n.chatUnmuteNotifications
+                            : l10n.chatMuteNotifications,
+                        style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w400, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              InkWell(
+                onTap: () => Navigator.pop(ctx, 'archive'),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 20,
+                    vertical: 16,
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(
+                        Icons.archive_outlined,
+                        size: 18,
+                        color: colors.textSecondary,
+                      ),
+                      const SizedBox(width: 14),
+                      Text(
+                        l10n.chatArchiveChat,
+                        style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w400, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              InkWell(
+                onTap: () => Navigator.pop(ctx, 'atmosphere'),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 20,
+                    vertical: 16,
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(
+                        Icons.palette_outlined,
+                        size: 18,
+                        color: colors.textSecondary,
+                      ),
+                      const SizedBox(width: 14),
+                      Text(
+                        l10n.chatWallpaper,
+                        style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w400, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              InkWell(
+                onTap: () => Navigator.pop(ctx, 'clear'),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 20,
+                    vertical: 16,
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(
+                        Icons.delete_sweep_outlined,
+                        size: 18,
+                        color: colors.textSecondary,
+                      ),
+                      const SizedBox(width: 14),
+                      Text(
+                        l10n.chatClearConversation,
+                        style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w400, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              InkWell(
+                onTap: () => Navigator.pop(ctx, 'note'),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 20,
+                    vertical: 16,
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(
+                        Icons.sticky_note_2_outlined,
+                        size: 18,
+                        color: colors.textSecondary,
+                      ),
+                      const SizedBox(width: 14),
+                      Text(
+                        l10n.chatNoteOnThisContact,
+                        style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w400, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              InkWell(
+                onTap: () => Navigator.pop(ctx, 'pin'),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 20,
+                    vertical: 16,
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(
+                        pinned ? Icons.push_pin : Icons.push_pin_outlined,
+                        size: 18,
+                        color: colors.textSecondary,
+                      ),
+                      const SizedBox(width: 14),
+                      Text(
+                        pinned ? l10n.chatUnpin : l10n.chatPinToTop,
+                        style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w400, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              InkWell(
+                onTap: () => Navigator.pop(ctx, 'block'),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 20,
+                    vertical: 16,
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(Icons.block, size: 18, color: colors.error),
+                      const SizedBox(width: 14),
+                      Text(
+                        l10n.chatBlockContact,
+                        style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w400, color: colors.error, height: 1.5, letterSpacing: 0),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 8),
+            ]),
+          ),
+        ),
+      ),
+    );
+    if (!mounted) return;
+    if (action == 'contact') {
+      _openContact();
+    } else if (action == 'introduce') {
+      await showIntroduceSheet(
+        context,
+        peerId: widget.peerHaloId,
+        peerName: _nickname ?? widget.peerHaloId,
+      );
+    } else if (action == 'mute') {
+      await _toggleMute();
+    } else if (action == 'archive') {
+      await appState.archive(widget.peerHaloId);
+      if (mounted) Navigator.of(context).pop();
+    } else if (action == 'block') {
+      await _blockContact();
+    } else if (action == 'clear') {
+      await _clearConversation();
+    } else if (action == 'atmosphere') {
+      await _pickAtmosphere();
+    } else if (action == 'note') {
+      await _editNote();
+      final c = await db.getContact(widget.peerHaloId);
+      if (mounted) setState(() => _note = c?['note'] as String?);
+    } else if (action == 'pin') {
+      await _toggleContactPin();
+    } else if (action == 'photos') {
+      await _openMediaGallery();
+    }
+  }
+
+  // the page for this person. the head taps land here, and the chat's own
+  // state reloads on the way back since a nickname or block may have changed
+  Future<void> _openContact() async {
+    await Navigator.of(context).push(
+      haloRoute(
+        ContactScreen(
+          haloId: widget.peerHaloId,
+          avatarSeed: widget.avatarSeed,
+          peerXPub: widget.peerXPub,
+          face: _peerFace,
+        ),
+      ),
+    );
+    if (!mounted) return;
+    final c = await db.getContact(widget.peerHaloId);
+    if (!mounted) return;
+    setState(() {
+      _nickname = c?['nickname'] as String?;
+      _muted = (c?['muted'] as int? ?? 0) == 1;
+      _verified = (c?['verified'] as int? ?? 0) == 1;
+      _blocked = (c?['blocked'] as int? ?? 0) == 1;
+    });
+    unawaited(appState.refreshContacts());
+  }
+
+  Future<void> _toggleContactPin() async {
+    final contact = await db.getContact(widget.peerHaloId);
+    final pinned = (contact?['pinned'] as int? ?? 0) == 1;
+    await db.setContactPinned(widget.peerHaloId, !pinned);
+    await appState.refreshContacts();
+    if (mounted) {
+      showHaloToast(context, pinned ? l10n.chatUnpinned : l10n.chatPinnedToTop);
+    }
+  }
+
+  Future<void> _editNote() async {
+    final contact = await db.getContact(widget.peerHaloId);
+    final current = (contact?['note'] as String?) ?? '';
+    final ctrl = TextEditingController(text: current);
+    if (!mounted) return;
+    await showHaloSheet<void>(
+      context,
+      scroll: true,
+      builder: (ctx) => Padding(
+        padding: EdgeInsets.only(
+          left: 20,
+          right: 20,
+          top: 18,
+          bottom: MediaQuery.of(ctx).viewInsets.bottom + 22,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const SheetHandle(),
+            Text(
+              l10n.chatNoteOnThisContact,
+              style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 18, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.normal, height: 1.05, letterSpacing: -0.015),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              l10n.chatJustForYouNever,
+              style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 12, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: ctrl,
+              autofocus: true,
+              minLines: 1,
+              maxLines: 4,
+              cursorColor: colors.accent,
+              style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 16, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+              decoration: InputDecoration(
+                hintText: l10n.chatAQuietReminder,
+                hintStyle: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 16, fontWeight: FontWeight.w400, color: colors.textTertiary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+                border: InputBorder.none,
+              ),
+            ),
+            const SizedBox(height: 18),
+            Align(
+              alignment: AlignmentDirectional.centerEnd,
+              child: GestureDetector(
+                onTap: () async {
+                  await db.setNote(widget.peerHaloId, ctrl.text.trim());
+                  if (!ctx.mounted) return;
+                  Navigator.pop(ctx);
+                  if (mounted) showHaloToast(context, l10n.chatNoteSaved);
+                },
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 18,
+                    vertical: 10,
+                  ),
+                  decoration: BoxDecoration(
+                    color: colors.accent.withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: Text(
+                    l10n.commonSave,
+                    style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w600, color: colors.accent, height: 1.5, letterSpacing: 0),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // the sheet previews live: each swatch changes the room behind it, and
+  // backing out puts the old one back
+  Future<void> _pickAtmosphere() async {
+    final before = _atmosphere;
+    final picked = await showWallpaperSheet(
+      context,
+      before,
+      allowPhoto: true,
+      onPreview: (a) {
+        if (mounted) setState(() => _atmosphere = a);
+      },
+    );
+    if (!mounted) return;
+    if (picked is WallpaperFromPhotos) {
+      setState(() => _atmosphere = before);
+      await _pickWallpaperImage();
+      return;
+    }
+    if (picked is! Atmo) {
+      setState(() => _atmosphere = before);
+      return;
+    }
+    HapticFeedback.selectionClick();
+    await _dropWallpaperFile();
+    await db.setAtmosphere(widget.peerHaloId, picked.name);
+    if (!mounted) return;
+    setState(() {
+      _atmosphere = picked;
+      _wallpaperPath = null;
+    });
+  }
+
+  Future<void> _dropWallpaperFile() async {
+    final old = _wallpaperPath;
+    if (old == null) return;
+    try {
+      await shredFile(old);
+    } catch (_) {}
+  }
+
+  // a picture from the gallery, shrunk by the picker, copied into the
+  // app's own folder. the gallery copy is not touched; ours goes on wipe.
+  Future<void> _pickWallpaperImage() async {
+    final x = await lockState.hold(
+      () => ImagePicker().pickImage(
+        source: ImageSource.gallery,
+        maxWidth: 1600,
+        maxHeight: 1600,
+        imageQuality: 80,
+      ),
+    );
+    if (x == null) return;
+    final bytes = await x.readAsBytes();
+    try {
+      await shredFile(x.path);
+    } catch (_) {}
+    final dir = await getApplicationDocumentsDirectory();
+    final folder = Directory('${dir.path}/wallpapers');
+    if (!await folder.exists()) await folder.create(recursive: true);
+    final file = File('${folder.path}/${widget.peerHaloId}.jpg');
+    await file.writeAsBytes(bytes, flush: true);
+    await db.setAtmosphere(widget.peerHaloId, 'image:${file.path}');
+    if (!mounted) return;
+    HapticFeedback.selectionClick();
+    setState(() {
+      _wallpaperPath = file.path;
+      _atmosphere = Atmo.none;
+    });
+  }
+
+  Future<void> _clearConversation() async {
+    final confirm = await showHaloSheet<bool>(
+      context,
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 18, 20, 20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const SheetHandle(),
+              Text(
+                l10n.chatClearThisConversation,
+                style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 18, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.normal, height: 1.05, letterSpacing: -0.015),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                l10n.chatEveryMessageHereIs,
+                style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+              ),
+              const SizedBox(height: 20),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(ctx, false),
+                    child: Text(
+                      l10n.commonCancel,
+                      style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  TextButton(
+                    onPressed: () => Navigator.pop(ctx, true),
+                    child: Text(
+                      l10n.chatClear,
+                      style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w600, color: colors.error, height: 1.5, letterSpacing: 0),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (confirm != true) return;
+    HapticFeedback.selectionClick();
+    await db.clearConversation(widget.peerHaloId);
+    await appState.refreshContacts();
+    if (!mounted) return;
+    setState(() {
+      _messages.clear();
+      _normaliseMessages();
+    });
+  }
+
+  void _openKeyVerification() {
+    Navigator.of(context).push(
+      haloRoute(
+        KeyVerificationScreen(
+          peerHaloId: widget.peerHaloId,
+          peerName: _nickname ?? widget.peerHaloId,
+          myXpub: engine.myXPubkey(),
+          peerXpub: widget.peerXPub,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _toggleMute() async {
+    if (_muted) {
+      await appState.unmute(widget.peerHaloId);
+    } else {
+      await appState.mute(widget.peerHaloId);
+    }
+    if (mounted) setState(() => _muted = !_muted);
+  }
+
+  Future<void> _blockContact() async {
+    final confirm = await showHaloSheet<bool>(
+      context,
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 18, 20, 14),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const SheetHandle(),
+              Row(
+                children: [
+                  Icon(Icons.block, size: 15, color: colors.accent),
+                  const SizedBox(width: 8),
+                  Text(
+                    l10n.chatBlockThisContact,
+                    style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 18, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Text(
+                l10n.chatTheirMessagesStopArriving,
+                style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+              ),
+              const SizedBox(height: 20),
+              Row(
+                children: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(ctx, false),
+                    child: Text(
+                      l10n.commonCancel,
+                      style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+                    ),
+                  ),
+                  const Spacer(),
+                  TextButton(
+                    onPressed: () => Navigator.pop(ctx, true),
+                    child: Text(
+                      l10n.commonBlock,
+                      style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w500, color: colors.accent, height: 1.5, letterSpacing: 0),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (confirm != true) return;
+    await appState.block(widget.peerHaloId);
+    if (mounted) setState(() => _blocked = true);
+  }
+
+  Future<void> _unblockContact() async {
+    await appState.unblock(widget.peerHaloId);
+    if (mounted) setState(() => _blocked = false);
+  }
+
+  Future<void> _acceptRequestPeer() async {
+    HapticFeedback.selectionClick();
+    await db.acceptRequest(widget.peerHaloId);
+    await appState.afterAccept(widget.peerHaloId);
+    if (mounted) {
+      setState(() {
+        _accepted = true;
+        _flag = null;
+      });
+    }
+  }
+
+  Future<void> _declineRequestPeer() async {
+    HapticFeedback.selectionClick();
+    await db.declineRequest(widget.peerHaloId);
+    await appState.refreshContacts();
+    if (mounted) Navigator.pop(context);
+  }
+
+  Future<void> _blockRequestPeer() async {
+    HapticFeedback.selectionClick();
+    await appState.block(widget.peerHaloId);
+    await db.clearUnread(widget.peerHaloId);
+    await appState.refreshContacts();
+    if (mounted) Navigator.pop(context);
+  }
+
+  Future<void> _toggleSaved(_Msg m) async {
+    if (m.msgUid == null) return;
+    final next = !m.saved;
+    setState(() => m.saved = next);
+    await db.setSaved(m.msgUid!, next);
+    if (mounted) {
+      showHaloToast(context, next ? l10n.chatSaved : l10n.chatRemovedFromSaved);
+    }
+  }
+
+  Future<void> _forwardMessage(_Msg m) async {
+    final targets = appState.contacts.where((c) => !c.blocked).toList();
+    final haloId = await showHaloSheet<String>(
+      context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const SheetHandle(),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 18, 20, 8),
+              child: Text(
+                l10n.chatForwardTo,
+                style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 18, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+              ),
+            ),
+            if (targets.isEmpty)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 4, 20, 20),
+                child: Text(
+                  l10n.chatNoContactsToForward,
+                  style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+                ),
+              )
+            else
+              // the sheet scrolls as one, so the list is laid out in full
+              // and does not scroll on its own
+              ListView(
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                padding: const EdgeInsets.only(bottom: 8),
+                children: [
+                  for (final c in targets)
+                    InkWell(
+                      onTap: () => Navigator.pop(ctx, c.haloId),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 20,
+                          vertical: 12,
+                        ),
+                        child: Row(
+                          children: [
+                            KryfoAvatar(seed: c.avatarSeed, size: 32),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Text(
+                                c.nickname ?? c.haloId,
+                                style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w500, height: 1.5, letterSpacing: 0),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+          ],
+        ),
+      ),
+    );
+    if (haloId == null || !mounted) return;
+    final row = await db.getContact(haloId);
+    if (row == null || !mounted) return;
+    Navigator.of(context).push(
+      haloRoute(
+        ChatScreen(
+          peerHaloId: haloId,
+          peerOnion: (row['onion'] as String?) ?? '',
+          peerXPub: (row['xpub'] as String?) ?? '',
+          avatarSeed: haloId,
+          avatarChoice: (row['avatar'] as num?)?.toInt(),
+          initialText: m.text,
+        ),
+      ),
+    );
+  }
+
+  void _onScroll() {
+    if (!_scrollCtrl.hasClients) return;
+    final pos = _scrollCtrl.position;
+    // reversed list: bottom is offset 0
+    final show = pos.pixels > 240;
+    if (!show) _seenCount = _messages.length;
+    if (show != _showScrollDown && mounted) {
+      setState(() => _showScrollDown = show);
+    }
+  }
+
+  void _scrollToBottom() {
+    if (!_scrollReady) return;
+    setState(() => _seenCount = _messages.length);
+    // reversed list: newest sits at offset 0.
+    _scrollCtrl.animateTo(
+      0,
+      duration: const UmbraMotion.durationSlow,
+      curve: UmbraMotion.easeOut,
+    );
+  }
+
+  bool _sameDay(DateTime a, DateTime b) =>
+      a.year == b.year && a.month == b.month && a.day == b.day;
+
+  DateTime _lastSticky = DateTime.fromMillisecondsSinceEpoch(0);
+  void _updateSticky() {
+    if (_suppressSticky || !_scrollCtrl.hasClients) return;
+    if (_scrollCtrl.position.maxScrollExtent <= 0) return;
+    // about ten times a second: this queries layout per day divider, and the
+    // raw scroll stream fires many times a frame
+    final now = DateTime.now();
+    if (now.difference(_lastSticky).inMilliseconds < 100) return;
+    _lastSticky = now;
+    final listObj = _listKey.currentContext?.findRenderObject();
+    if (listObj is! RenderBox) return;
+    final top = listObj.localToGlobal(Offset.zero).dy;
+    int? best;
+    double bestDy = -1e9;
+    _dayKeys.forEach((anchor, key) {
+      final obj = key.currentContext?.findRenderObject();
+      if (obj is! RenderBox) return;
+      final dy = obj.localToGlobal(Offset.zero).dy;
+      // the floating chip sits at the top of this same list, so a divider
+      // has only passed once its bottom edge is above the top, or the day
+      // shows twice
+      if (dy + obj.size.height <= top && dy > bestDy) {
+        bestDy = dy;
+        best = _dayMsOf[anchor];
+      }
+    });
+    if (best != null) _stickyDayMs = best;
+    if (_stickyDayMs != null) {
+      _stickyLabel.value = _dayLabel(
+        DateTime.fromMillisecondsSinceEpoch(_stickyDayMs!),
+      );
+    }
+    _stickyShown.value = true;
+    _stickyHideTimer?.cancel();
+    _stickyHideTimer = Timer(
+      const Duration(milliseconds: 900),
+      () => _stickyShown.value = false,
+    );
+  }
+
+  String _dayLabel(DateTime when) {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final d = DateTime(when.year, when.month, when.day);
+    final diff = today.difference(d).inDays;
+    if (diff == 0) return l10n.chatToday;
+    if (diff == 1) return l10n.chatYesterday;
+    return dayMonthMaybeYear(when, now: now);
+  }
+
+  Widget _dateDivider(DateTime when, String anchor) {
+    final dayMs = DateTime(
+      when.year,
+      when.month,
+      when.day,
+    ).millisecondsSinceEpoch;
+    final key = _dayKeys.putIfAbsent(anchor, () => GlobalKey());
+    _dayMsOf[anchor] = dayMs;
+    return Padding(
+      key: key,
+      padding: const EdgeInsets.symmetric(vertical: 14),
+      child: Center(
+        child: Text(
+          _dayLabel(when),
+          style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 12.5, fontWeight: FontWeight.w300, color: colors.textTertiary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+  final colors = UmbraTheme.colorsOf(context);
+
+    final searchActive = _searching && _query.isNotEmpty;
+    return Scaffold(
+      backgroundColor: colors.surface,
+      body: SafeArea(
+        child: Column(
+          children: [
+            _searching
+                ? SearchHead(
+                    controller: _searchCtrl,
+                    matchCount: _matches.length,
+                    matchPos: _matches.isEmpty ? 0 : _matchPos + 1,
+                    onChanged: _onQueryChanged,
+                    onPrev: () => _gotoMatch(-1),
+                    onNext: () => _gotoMatch(1),
+                    onClose: _closeSearch,
+                  )
+                : _ChatHead(
+                    haloId: widget.peerHaloId,
+                    nickname: _nickname,
+                    note: _note,
+                    verified: _verified,
+                    supporterBadge: _peerBadge,
+                    onBlock: _openContact,
+                    onMore: _chatActions,
+                    avatarSeed: widget.avatarSeed,
+                    face: _peerFace,
+                    onBack: () => Navigator.pop(context),
+                    onSearch: _openSearch,
+                    onRename: _openContact,
+                    pinnedCount: _pinCount,
+                    onPinned: _showPinnedSheet,
+                  ),
+            if (_flag != null && !_accepted)
+              const SizedBox.shrink()
+            else if (_vouched && !_accepted && _recvCount == 0)
+              _IntroBanner(
+                names: _voucherNames,
+                seed: _voucherSeed!,
+                avatar: _voucherAvatar,
+                verified: _voucherVerified,
+              )
+            else if (_requestPending && _sentCount > 0)
+              const _RequestBanner(),
+            if (_keyChanged)
+              _KeyChangedBanner(
+                peerName: _nickname ?? widget.peerHaloId,
+                onVerify: _openKeyVerification,
+                onDismiss: _dismissKeyChanged,
+              ),
+            Expanded(
+              child: AtmoScope(
+                atmo: _atmosphere,
+                child: Stack(
+                  key: _listKey,
+                  children: [
+                    if (_wallpaperPath != null) ...[
+                      Positioned.fill(
+                        child: Image.file(
+                          File(_wallpaperPath!),
+                          fit: BoxFit.cover,
+                          gaplessPlayback: true,
+                          cacheWidth: screenPx(context),
+                        ),
+                      ),
+                      // a wash so the bubbles keep reading over any photo
+                      Positioned.fill(
+                        child: ColoredBox(
+                          color: colors.ink.withValues(alpha: 0.42),
+                        ),
+                      ),
+                    ],
+                    if (_atmosphere != Atmo.none)
+                      Positioned.fill(child: AtmosphereWash(_atmosphere)),
+                    !_loaded
+                        ? const SizedBox.shrink()
+                        : _messages.isEmpty
+                        ? const _EmptyConversation()
+                        : ListView.builder(
+                            controller: _scrollCtrl,
+                            reverse: true,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 16,
+                              vertical: 12,
+                            ),
+                            itemCount: _messages.length,
+                            findChildIndexCallback: _indexOfRow,
+                            itemBuilder: (c, i) {
+                              // one unbuildable message must never cost
+                              // the whole conversation. draw a stub and
+                              // carry on.
+                              try {
+                                // keyed by the message at the top, where
+                                // the list looks: in a reversed list every
+                                // arrival moves every index, and a voice
+                                // note must keep its player. the same id
+                                // is the anchor a jump lands on.
+                                final id = _rowKey(
+                                  _messages[_messages.length - 1 - i],
+                                );
+                                return RowAnchor(
+                                  key: ValueKey(id),
+                                  anchors: _anchors,
+                                  id: id,
+                                  child: _buildRow(c, i, searchActive),
+                                );
+                              } catch (e) {
+                                dlog('bubble failed: $e');
+                                return Padding(
+                                  padding: const EdgeInsets.symmetric(
+                                    vertical: 6,
+                                  ),
+                                  child: Text(
+                                    l10n.chatThisMessageCanT,
+                                    style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 12, fontWeight: FontWeight.w400, color: colors.textTertiary, height: 1.5, letterSpacing: 0),
+                                  ),
+                                );
+                              }
+                            },
+                          ),
+                    Positioned(
+                      left: 0,
+                      right: 0,
+                      bottom: 12,
+                      child: IgnorePointer(
+                        ignoring: !_showScrollDown,
+                        child: AnimatedScale(
+                          scale: _showScrollDown ? 1.0 : 0.6,
+                          duration: const UmbraMotion.durationNormal,
+                          curve: Curves.easeOutBack,
+                          child: AnimatedOpacity(
+                            opacity: _showScrollDown ? 1.0 : 0.0,
+                            duration: const Duration(milliseconds: 180),
+                            child: Center(
+                              child: Stack(
+                                clipBehavior: Clip.none,
+                                alignment: Alignment.center,
+                                children: [
+                                  Semantics(
+                                    label: l10n.chatJumpToTheNewest,
+                                    button: true,
+                                    child: GestureDetector(
+                                      onTap: _scrollToBottom,
+                                      child: Container(
+                                        width: 38,
+                                        height: 38,
+                                        decoration: BoxDecoration(
+                                          shape: BoxShape.circle,
+                                          color: colors.surfaceElevated,
+                                          border: Border.all(
+                                            color: colors.accent.withValues(
+                                              alpha: 0.5,
+                                            ),
+                                            width: 0.5,
+                                          ),
+                                          boxShadow: [
+                                            BoxShadow(
+                                              color: colors.accent
+                                                  .withValues(alpha: 0.18),
+                                              blurRadius: 14,
+                                              spreadRadius: -2,
+                                            ),
+                                          ],
+                                        ),
+                                        alignment: Alignment.center,
+                                        child: Icon(
+                                          Icons.keyboard_arrow_down_rounded,
+                                          color: colors.accent,
+                                          size: 22,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                  if (_messages.length - _seenCount > 0)
+                                    PositionedDirectional(
+                                      top: -3,
+                                      end: -3,
+                                      child: Container(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 5,
+                                          vertical: 1,
+                                        ),
+                                        constraints: const BoxConstraints(
+                                          minWidth: 17,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: colors.accent,
+                                          borderRadius: BorderRadius.circular(
+                                            9,
+                                          ),
+                                          border: Border.all(
+                                            color: colors.surface,
+                                            width: 1.5,
+                                          ),
+                                        ),
+                                        alignment: Alignment.center,
+                                        child: Text(
+                                          '${_messages.length - _seenCount}',
+                                          style:
+                                              TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 9, fontWeight: FontWeight.w500, color: colors.accentOn, letterSpacing: 0.12).copyWith(
+                                                fontWeight: FontWeight.w700,
+                                                height: 1.2,
+                                              ),
+                                        ),
+                                      ),
+                                    ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                    Positioned(
+                      top: 6,
+                      left: 0,
+                      right: 0,
+                      child: IgnorePointer(
+                        child: Center(
+                          child: ValueListenableBuilder<bool>(
+                            valueListenable: _stickyShown,
+                            builder: (_, shown, _) => AnimatedOpacity(
+                              duration: const Duration(milliseconds: 220),
+                              opacity: shown ? 1.0 : 0.0,
+                              child: ValueListenableBuilder<String?>(
+                                valueListenable: _stickyLabel,
+                                builder: (_, label, _) => label == null
+                                    ? const SizedBox.shrink()
+                                    : Container(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 12,
+                                          vertical: 5,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: colors.surfaceElevated.withValues(
+                                            alpha: 0.92,
+                                          ),
+                                          borderRadius: BorderRadius.circular(
+                                            20,
+                                          ),
+                                          border: Border.all(
+                                            color: colors.separator,
+                                          ),
+                                        ),
+                                        child: Text(
+                                          label,
+                                          style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 12, fontWeight: FontWeight.w300, color: colors.textSecondary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+                                        ),
+                                      ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            if (_friendlyStatus(_status).isNotEmpty && !appState.movedAway)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 4),
+                child: Text(
+                  _friendlyStatus(_status),
+                  style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: colors.accent, letterSpacing: 0.12),
+                ),
+              ),
+            const PowNote(),
+            // tor still warming: messages typed now are queued. not on a
+            // phone whose identity has moved, where tor is off on purpose.
+            if (appState.sendMode == 'private' &&
+                !_torReadyToSend() &&
+                !appState.movedAway)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const TorHalo(),
+                    const SizedBox(width: 7),
+                    Flexible(
+                      child: Text(
+                        l10n.chatBuildingAPrivateRoute,
+                        style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 10.5, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0).copyWith(height: 1.35),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            if (_flag != null && !_accepted && !_blocked)
+              NoticeBanner(
+                glyph: NoticeGlyph.shield,
+                text: _flag!.headline,
+                color: colors.error,
+                margin: const EdgeInsets.fromLTRB(14, 0, 14, 8),
+                onTap: _openShield,
+              )
+            else if (_shieldClean && !_accepted && !_blocked)
+              // the calm state. same banner, softest colour, nothing to tap
+              NoticeBanner(
+                glyph: NoticeGlyph.shield,
+                text: l10n.chatLooksSafeNothingSuspicious,
+                color: colors.textSecondary,
+                margin: const EdgeInsets.fromLTRB(14, 0, 14, 8),
+              ),
+            AnimatedSwitcher(
+              duration: const Duration(milliseconds: 220),
+              switchInCurve: UmbraMotion.easeOut,
+              switchOutCurve: UmbraMotion.easeSharp,
+              transitionBuilder: (child, anim) => SizeTransition(
+                sizeFactor: anim,
+                axisAlignment: -1,
+                child: FadeTransition(opacity: anim, child: child),
+              ),
+              child: _replyTo != null
+                  ? _ReplyQuoteBar(
+                      target: _replyTo!,
+                      onCancel: () => setState(() => _replyTo = null),
+                    )
+                  : const SizedBox.shrink(),
+            ),
+            IncomingMediaBanner(
+              chatKey: widget.peerHaloId,
+              onCancel: (uid) {
+                for (final m in _messages) {
+                  if (m.msgUid == uid) {
+                    _stopSending(m);
+                    return;
+                  }
+                }
+              },
+            ),
+            AnimatedSwitcher(
+              duration: const Duration(milliseconds: 260),
+              switchInCurve: UmbraMotion.easeOut,
+              switchOutCurve: UmbraMotion.easeSharp,
+              transitionBuilder: (child, anim) => SizeTransition(
+                sizeFactor: anim,
+                axisAlignment: -1,
+                child: FadeTransition(opacity: anim, child: child),
+              ),
+              child: KeyedSubtree(
+                key: ValueKey(
+                  _blocked
+                      ? 'bar_blocked'
+                      : _incomingRequest
+                      ? 'bar_request'
+                      : _requestLocked
+                      ? 'bar_locked'
+                      : 'bar_composer',
+                ),
+                child: _blocked
+                    ? _BlockedBar(onUnblock: _unblockContact)
+                    : _incomingRequest
+                    ? _AcceptRequestBar(
+                        introducer: _vouched ? vouchNames(_voucherNames) : null,
+                        onAccept: _acceptRequestPeer,
+                        onDecline: _declineRequestPeer,
+                        onBlock: _blockRequestPeer,
+                      )
+                    : _requestLocked
+                    ? const _RequestLockBar()
+                    : Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          ValueListenableBuilder<TextEditingValue>(
+                            valueListenable: _msgCtrl,
+                            // offered only while tor is up: the fetch goes
+                            // over tor or not at all, so without it there is
+                            // nothing to offer
+                            builder: (_, v, _) => PreviewStrip(
+                              url: _accepted && _torUp
+                                  ? firstUrl(v.text)
+                                  : null,
+                              pending: _pendingPreview,
+                              busy: _previewBusy,
+                              onAdd: _addPreview,
+                              onDrop: () =>
+                                  setState(() => _pendingPreview = null),
+                            ),
+                          ),
+                          _Composer(
+                            onAttach: _showAttachSheet,
+                            onCamera: _openCamera,
+                            ghost: _ghost,
+                            secure: _secureNext,
+                            onToggleSecure: () {
+                              HapticFeedback.selectionClick();
+                              setState(() => _secureNext = !_secureNext);
+                              showHaloToast(
+                                context,
+                                _secureNext
+                                    ? l10n.chatTheNextPhotoYou
+                                    : l10n.chatPhotoProtectionOff,
+                              );
+                            },
+                            onToggleGhost: () => setState(() {
+                              _ghost = !_ghost;
+                              _lastGhost = _ghost;
+                              appState.saveGhostPref(_ghost, _burnSeconds);
+                            }),
+                            onPickBurn: _pickBurnDuration,
+                            burnSeconds: _burnSeconds,
+                            controller: _msgCtrl,
+                            sending: _sending,
+                            onSend: _send,
+                            disguise: _disguise,
+                            onToggleDisguise: _toggleDisguise,
+                            onVoiceComplete: _onVoiceComplete,
+                          ),
+                        ],
+                      ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// quick press-down scale for the request buttons.
+class _ScaleTap extends StatefulWidget {
+  final Widget child;
+  final VoidCallback onTap;
+  const _ScaleTap({required this.child, required this.onTap});
+  @override
+  State<_ScaleTap> createState() => _ScaleTapState();
+}
+
+class _ScaleTapState extends State<_ScaleTap> {
+  bool _down = false;
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return GestureDetector(
+      onTapDown: (_) => setState(() => _down = true),
+      onTapCancel: () => setState(() => _down = false),
+      onTapUp: (_) => setState(() => _down = false),
+      onTap: widget.onTap,
+      child: AnimatedScale(
+        scale: _down ? 0.96 : 1.0,
+        duration: const Duration(milliseconds: 90),
+        curve: UmbraMotion.easeOut,
+        child: widget.child,
+      ),
+    );
+  }
+}
+
+// shown at the bottom of a chat when a stranger has messaged us and we
+// haven't accepted them yet. accept opens the chat; decline dismisses quietly.
+class _AcceptRequestBar extends StatelessWidget {
+  final String? introducer; // set when a friend vouched for them
+  final VoidCallback onAccept;
+  final VoidCallback onDecline;
+  final VoidCallback onBlock;
+  const _AcceptRequestBar({
+    this.introducer,
+    required this.onAccept,
+    required this.onDecline,
+    required this.onBlock,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return Container(
+      padding: const EdgeInsets.fromLTRB(14, 13, 14, 16),
+      decoration: BoxDecoration(
+        border: Border(top: BorderSide(color: colors.separator, width: 0.5)),
+      ),
+      child: Column(
+        children: [
+          Text(
+            introducer == null
+                ? l10n.chatAcceptToReplyThey
+                : l10n.chatIntroducedYouAcceptTo('$introducer'),
+            textAlign: TextAlign.center,
+            style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 12.5, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+          ),
+          const SizedBox(height: 11),
+          Row(
+            children: [
+              _reqBtn(
+                l10n.chatBlock,
+                colors.error,
+                colors.surfaceElevated,
+                onBlock,
+              ),
+              const SizedBox(width: 8),
+              _reqBtn(
+                l10n.chatDecline,
+                colors.textPrimary,
+                colors.surfaceElevated,
+                onDecline,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _reqBtn(
+                  l10n.chatAccept,
+                  colors.accentOn,
+                  colors.accent,
+                  onAccept,
+                  bold: true,
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _reqBtn(
+    String label,
+    Color fg,
+    Color bg,
+    VoidCallback onTap, {
+    bool bold = false,
+  }) {
+    return _ScaleTap(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 11, horizontal: 18),
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: bg,
+          borderRadius: BorderRadius.circular(UmbraRadius.lg),
+          border: bg == colors.surfaceElevated
+              ? Border.all(color: colors.separator, width: 0.5)
+              : null,
+        ),
+        child: Text(
+          label,
+          style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: fg, height: 1.5, letterSpacing: 0).copyWith(fontWeight: bold ? FontWeight.w600 : FontWeight.w400),
+        ),
+      ),
+    );
+  }
+}
+
+// shown above the thread when a friend introduced this peer and neither side
+// has said anything yet. takes the place of the stranger warning.
+class _IntroBanner extends StatelessWidget {
+  final List<String> names;
+  final String seed;
+  final int? avatar;
+  final bool verified;
+  const _IntroBanner({
+    required this.names,
+    required this.seed,
+    this.avatar,
+    this.verified = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+      padding: const EdgeInsets.fromLTRB(13, 11, 13, 12),
+      decoration: BoxDecoration(
+        color: colors.accent.withValues(alpha: 0.08),
+        border: Border.all(color: colors.accent.withValues(alpha: 0.25)),
+        borderRadius: BorderRadius.circular(UmbraRadius.lg),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          IntroducedBy(
+            label: introducedByLine(names),
+            seed: seed,
+            avatar: avatar,
+            verified: verified,
+            delay: const Duration(milliseconds: 120),
+          ),
+          const SizedBox(height: 7),
+          Text(
+            l10n.chatIntroducedYouSayHello(vouchNames(names)),
+            style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 12.5, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// greyed with a reason while the contact is still a request: you cannot
+// vouch for someone you have not accepted yourself
+class _IntroduceRow extends StatelessWidget {
+  final bool enabled;
+  final VoidCallback onTap;
+  const _IntroduceRow({required this.enabled, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return InkWell(
+      onTap: enabled ? onTap : null,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+        child: Row(
+          children: [
+            Icon(
+              Icons.people_outline,
+              size: 18,
+              color: enabled ? colors.accent : colors.textTertiary,
+            ),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    l10n.chatIntroduceTo,
+                    style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w400, color: enabled ? colors.textPrimary : colors.textTertiary, height: 1.5, letterSpacing: 0),
+                  ),
+                  if (!enabled)
+                    Text(
+                      l10n.chatAcceptThemFirst,
+                      style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 9.5, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.12),
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// shown above the thread when we're messaging someone who hasn't accepted us.
+class _RequestBanner extends StatelessWidget {
+  const _RequestBanner();
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+      padding: const EdgeInsets.fromLTRB(13, 10, 13, 11),
+      decoration: BoxDecoration(
+        color: colors.accent.withValues(alpha: 0.08),
+        border: Border.all(color: colors.accent.withValues(alpha: 0.25)),
+        borderRadius: BorderRadius.circular(UmbraRadius.lg),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.schedule, size: 13, color: colors.accent),
+              const SizedBox(width: 7),
+              Text(
+                l10n.chatMessageRequest,
+                style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.normal, height: 1.05, letterSpacing: -0.015),
+              ),
+            ],
+          ),
+          const SizedBox(height: 5),
+          Text(
+            l10n.chatTheyNeedToAccept,
+            style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 12.5, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// replaces the composer once we've hit the 2-message request cap.
+class _RequestLockBar extends StatelessWidget {
+  const _RequestLockBar();
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 16),
+      decoration: BoxDecoration(
+        border: Border(top: BorderSide(color: colors.separator, width: 0.5)),
+      ),
+      child: Column(
+        children: [
+          Row(
+            children: [
+              Icon(Icons.lock_outline, size: 15, color: colors.accent),
+              const SizedBox(width: 9),
+              Expanded(
+                child: Text(
+                  l10n.chatWaitingForThemTo,
+                  style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _BlockedBar extends StatelessWidget {
+  final VoidCallback onUnblock;
+  const _BlockedBar({required this.onUnblock});
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return Container(
+      padding: const EdgeInsetsDirectional.fromSTEB(20, 16, 12, 16),
+      decoration: BoxDecoration(
+        border: Border(top: BorderSide(color: colors.separator, width: 0.5)),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.block, size: 15, color: colors.textTertiary),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              l10n.chatYouBlockedThisContact,
+              style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 14, fontWeight: FontWeight.w400, color: colors.textSecondary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+            ),
+          ),
+          TextButton(
+            onPressed: onUnblock,
+            child: Text(
+              l10n.commonUnblock,
+              style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w500, color: colors.accent, height: 1.5, letterSpacing: 0),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ChatHead extends StatelessWidget {
+  final String haloId;
+  final String? nickname;
+  final String avatarSeed;
+  final int? face;
+  final VoidCallback onBack;
+  final VoidCallback onSearch;
+  final VoidCallback onRename;
+  final VoidCallback onBlock;
+  final VoidCallback onMore;
+  final int pinnedCount;
+  final VoidCallback onPinned;
+  final bool verified;
+  final String? note;
+  final String? supporterBadge;
+  const _ChatHead({
+    required this.haloId,
+    this.nickname,
+    required this.avatarSeed,
+    this.face,
+    required this.onBack,
+    required this.onSearch,
+    required this.onRename,
+    required this.onMore,
+    required this.onBlock,
+    this.pinnedCount = 0,
+    required this.onPinned,
+    this.verified = false,
+    this.note,
+    this.supporterBadge,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return Container(
+      padding: const EdgeInsetsDirectional.fromSTEB(4, 4, 8, 12),
+      decoration: BoxDecoration(
+        border: Border(bottom: BorderSide(color: colors.separator, width: 0.5)),
+      ),
+      child: Row(
+        children: [
+          IconButton(
+            tooltip: l10n.commonBack,
+            icon: Icon(Icons.chevron_left, color: colors.textSecondary, size: 26),
+            onPressed: onBack,
+          ),
+          GestureDetector(
+            onTap: onBlock, // avatar opens the contact page
+            behavior: HitTestBehavior.opaque,
+            // the same face flies in from the list row
+            child: Hero(
+              tag: 'face-$avatarSeed',
+              child: KryfoAvatar(seed: avatarSeed, size: 36, choice: face),
+            ),
+          ),
+          const SizedBox(width: 11),
+          Expanded(
+            child: GestureDetector(
+              onTap: onRename,
+              behavior: HitTestBehavior.opaque,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Flexible(
+                        child: AnimatedSwitcher(
+                          duration: const UmbraMotion.durationSlow,
+                          transitionBuilder: (child, anim) => FadeTransition(
+                            opacity: anim,
+                            child: ScaleTransition(
+                              scale: Tween<double>(
+                                begin: 0.98,
+                                end: 1.0,
+                              ).animate(anim),
+                              child: child,
+                            ),
+                          ),
+                          child: Text(
+                            nickname ?? haloId,
+                            key: ValueKey<String>(nickname ?? haloId),
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w500, height: 1.5, letterSpacing: 0),
+                          ),
+                        ),
+                      ),
+                      if (verified) ...[
+                        const SizedBox(width: 6),
+                        Icon(
+                          Icons.verified_user,
+                          size: 13,
+                          color: colors.accent,
+                        ),
+                      ],
+                      if (supporterBadge != null) ...[
+                        const SizedBox(width: 6),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 5,
+                            vertical: 1,
+                          ),
+                          decoration: BoxDecoration(
+                            color: colors.accent.withValues(alpha: 0.18),
+                            borderRadius: BorderRadius.circular(5),
+                            border: Border.all(
+                              color: colors.accent.withValues(alpha: 0.4),
+                            ),
+                          ),
+                          child: Text(
+                            l10n.chatSupporter,
+                            style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 7.5, fontWeight: FontWeight.w500, color: colors.accent, letterSpacing: 0.12),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                  if (nickname != null)
+                    Text(
+                      haloId,
+                      style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: colors.textSecondary, letterSpacing: 0.12),
+                    ),
+                  Padding(
+                    padding: const EdgeInsets.only(top: 2),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.lock_outline,
+                          size: 10,
+                          color: colors.accent,
+                        ),
+                        const SizedBox(width: 4),
+                        // a longer language at a big font size would run
+                        // past the header's buttons, so it ends in …
+                        Flexible(
+                          child: Text(
+                            appState.sendMode == 'balanced'
+                                ? l10n.chatEncryptedViaRelay
+                                : appState.sendMode == 'fast'
+                                ? l10n.chatEncryptedDirect
+                                : l10n.chatEncryptedOverTor,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: colors.textSecondary, letterSpacing: 0.12),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  if ((note ?? '').isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 3),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.sticky_note_2_outlined,
+                            size: 11,
+                            color: colors.accent,
+                          ),
+                          const SizedBox(width: 4),
+                          Flexible(
+                            child: Text(
+                              note!,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 12, fontWeight: FontWeight.w400, color: colors.accent, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+
+          PinHeaderButton(count: pinnedCount, onTap: onPinned),
+          IconButton(
+            tooltip: l10n.chatSearchThisChat,
+            icon: Icon(Icons.search_rounded, color: colors.textSecondary, size: 21),
+            onPressed: onSearch,
+          ),
+          IconButton(
+            tooltip: l10n.chatContactOptions,
+            icon: Icon(Icons.more_vert, color: colors.textSecondary, size: 21),
+            onPressed: onMore,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// replaces the chat header while searching
+class SearchHead extends StatefulWidget {
+  final TextEditingController controller;
+  final int matchCount;
+  final int matchPos; // 1-based; 0 when no matches
+  final ValueChanged<String> onChanged;
+  final VoidCallback onPrev;
+  final VoidCallback onNext;
+  final VoidCallback onClose;
+  const SearchHead({
+    super.key,
+    required this.controller,
+    required this.matchCount,
+    required this.matchPos,
+    required this.onChanged,
+    required this.onPrev,
+    required this.onNext,
+    required this.onClose,
+  });
+
+  @override
+  State<SearchHead> createState() => _SearchHeadState();
+}
+
+class _SearchHeadState extends State<SearchHead> {
+  final _focus = FocusNode();
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _focus.requestFocus();
+    });
+  }
+
+  @override
+  void dispose() {
+    _focus.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    final hasQuery = widget.controller.text.trim().isNotEmpty;
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0, end: 1),
+      duration: const UmbraMotion.durationNormal,
+      curve: UmbraMotion.easeOut,
+      builder: (context, t, child) => Opacity(
+        opacity: t,
+        child: Transform.translate(
+          offset: Offset(0, -10 * (1 - t)),
+          child: child,
+        ),
+      ),
+      child: Container(
+        padding: const EdgeInsetsDirectional.fromSTEB(8, 6, 12, 11),
+        decoration: BoxDecoration(
+          border: Border(
+            bottom: BorderSide(color: colors.separator, width: 0.5),
+          ),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(
+              children: [
+                IconButton(
+                  tooltip: l10n.commonClose,
+                  icon: Icon(
+                    Icons.close_rounded,
+                    color: colors.textSecondary,
+                    size: 20,
+                  ),
+                  onPressed: widget.onClose,
+                ),
+                Expanded(
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 2,
+                    ),
+                    decoration: BoxDecoration(
+                      color: colors.surfaceElevated,
+                      borderRadius: BorderRadius.circular(999),
+                      border: Border.all(color: colors.separatorStrong, width: 0.5),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(
+                          Icons.search_rounded,
+                          size: 15,
+                          color: colors.accent,
+                        ),
+                        const SizedBox(width: 9),
+                        Expanded(
+                          child: TextField(
+                            controller: widget.controller,
+                            inputFormatters: const [UnmarkedInput()],
+                            focusNode: _focus,
+                            onChanged: widget.onChanged,
+                            cursorColor: colors.accent,
+                            cursorWidth: 1.5,
+                            style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+                            decoration: InputDecoration(
+                              isDense: true,
+                              border: InputBorder.none,
+                              hintText: l10n.chatFindInConversation,
+                              hintStyle: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textTertiary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+                              contentPadding: const EdgeInsets.symmetric(
+                                vertical: 10,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            AnimatedSwitcher(
+              duration: const Duration(milliseconds: 180),
+              transitionBuilder: (child, anim) => SizeTransition(
+                sizeFactor: anim,
+                axisAlignment: -1,
+                child: FadeTransition(opacity: anim, child: child),
+              ),
+              child: hasQuery
+                  ? Padding(
+                      key: const ValueKey('search-meta'),
+                      padding: const EdgeInsets.fromLTRB(6, 9, 6, 0),
+                      child: Row(
+                        children: [
+                          Text.rich(
+                            TextSpan(
+                              style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: colors.textSecondary, letterSpacing: 0.12),
+                              children: widget.matchCount == 0
+                                  ? [
+                                      TextSpan(
+                                        text: l10n.chatNoMatches,
+                                        style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.12),
+                                      ),
+                                    ]
+                                  : markedSpans(
+                                      l10n.chatOf(
+                                        widget.matchCount,
+                                        widget.matchPos,
+                                      ),
+                                      TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: colors.accent, letterSpacing: 0.12),
+                                    ),
+                            ),
+                          ),
+                          const Spacer(),
+                          _NavBtn(
+                            icon: Icons.keyboard_arrow_up_rounded,
+                            label: l10n.chatPreviousMatch,
+                            enabled: widget.matchCount > 0,
+                            onTap: widget.onPrev,
+                          ),
+                          const SizedBox(width: 5),
+                          _NavBtn(
+                            icon: Icons.keyboard_arrow_down_rounded,
+                            label: l10n.chatNextMatch,
+                            enabled: widget.matchCount > 0,
+                            onTap: widget.onNext,
+                          ),
+                        ],
+                      ),
+                    )
+                  : const SizedBox.shrink(),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// small up/down chevron button for the search match navigator.
+class _NavBtn extends StatelessWidget {
+  final IconData icon;
+  final bool enabled;
+  final VoidCallback onTap;
+  final String label;
+  const _NavBtn({
+    required this.icon,
+    required this.label,
+    required this.enabled,
+    required this.onTap,
+  });
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return Semantics(
+      label: label,
+      button: true,
+      enabled: enabled,
+      child: GestureDetector(
+        onTap: enabled ? onTap : null,
+        child: Container(
+          width: 24,
+          height: 24,
+          decoration: BoxDecoration(
+            color: enabled ? colors.accentSoft : colors.surfaceElevated,
+            borderRadius: BorderRadius.circular(7),
+            border: Border.all(
+              color: enabled
+                  ? colors.accent.withValues(alpha: 0.45)
+                  : colors.separatorStrong,
+              width: 0.5,
+            ),
+          ),
+          alignment: Alignment.center,
+          child: Icon(
+            icon,
+            size: 16,
+            color: enabled ? colors.accent : colors.textTertiary,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _Bubble extends StatelessWidget {
+  // uids whose entrance animation already played, so a list rebuild doesn't
+  // replay it
+  static final Set<String> _entered = {};
+  final _Msg msg;
+  final void Function(_Msg)? onRetry;
+  final void Function(BuildContext)? onLongPress;
+  final bool secure;
+  final String? quotedText;
+  final String? quotedAuthor;
+  final VoidCallback? onQuoteTap;
+  // search: the live query (empty when not searching), whether this bubble
+  // is the current hit, and whether it dims as a non-match
+  final String query;
+  final bool isCurrentMatch;
+  final bool dimmed;
+  final bool ripple;
+  final bool revealed;
+  final VoidCallback? onReveal;
+  final bool firstInGroup;
+  final bool lastInGroup;
+  // a link in the text: the title the sender shipped, if any
+  final String? linkTitle;
+  final bool linkBySender;
+  const _Bubble({
+    super.key,
+    required this.msg,
+    this.onRetry,
+    this.onLongPress,
+    this.secure = false,
+    this.quotedText,
+    this.quotedAuthor,
+    this.onQuoteTap,
+    this.query = '',
+    this.isCurrentMatch = false,
+    this.dimmed = false,
+    this.ripple = false,
+    this.revealed = false,
+    this.onReveal,
+    this.linkTitle,
+    this.linkBySender = false,
+    this.firstInGroup = true,
+    this.lastInGroup = true,
+  });
+
+  // builds the message body, underlining query matches in amber. plain
+  // Text when there's no active query.
+  Widget _body(bool isOut, {bool image = false}) {
+    final base = image
+        ? TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 13.5, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015)
+        : TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w400, color: (isOut && !image, height: 1.5, letterSpacing: 0) ? colors.accentOn : colors.textPrimary,
+            height: 1.4,
+          );
+    if (query.isEmpty) {
+      return KryfoLinkText(
+        text: msg.text,
+        style: base,
+        onAmber: isOut && !image,
+        linkColor: (isOut && !image) ? colors.accentOn : colors.accent,
+      );
+    }
+    final text = msg.text;
+    final lower = text.toLowerCase();
+    final q = query.toLowerCase();
+    final spans = <TextSpan>[];
+    var start = 0;
+    while (true) {
+      final hit = lower.indexOf(q, start);
+      if (hit < 0) {
+        spans.add(TextSpan(text: text.substring(start)));
+        break;
+      }
+      if (hit > start) {
+        spans.add(TextSpan(text: text.substring(start, hit)));
+      }
+      spans.add(
+        TextSpan(
+          text: text.substring(hit, hit + q.length),
+          style: TextStyle(
+            color: (isOut && !image) ? colors.accentOn : colors.accent,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      );
+      start = hit + q.length;
+    }
+    return Text.rich(TextSpan(style: base, children: spans));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    final isOut = msg.direction == 'out';
+    final isImage = msg.mediaPath != null;
+    // a video with no caption sits on the chat like a photo: no bubble
+    // around it, its time and tick in its corner
+    final isVideo =
+        msg.filePath != null &&
+        msg.text.isEmpty &&
+        msg.fileName != 'voice.wav' &&
+        nameSaysVideo(msg.fileName);
+    final frameless = isImage || isVideo;
+    final failedShown = _sendLooksFailed(msg);
+    final parked = msg.parked && !msg.sending && !msg.failed;
+    final pending = msg.sending || (msg.failed && !failedShown);
+    // a finished media send means every slice was accepted somewhere, not
+    // that it arrived: a relay taking the bytes is not the peer reading
+    // them. so media says nothing until the receipt lands, then Delivered.
+    final isMedia = msg.mediaPath != null || msg.filePath != null;
+    final ackOk = !isMedia || msg.delivered;
+    final showMeta = isOut && !pending && !failedShown && !parked && ackOk;
+    final showPill = isOut && pending;
+    final metaColor = (isOut && !frameless)
+        ? colors.accentOn.withValues(alpha: 0.55)
+        : colors.textTertiary;
+    final remainingMs = msg.burnAt != null
+        ? msg.burnAt! - DateTime.now().millisecondsSinceEpoch
+        : 9999999;
+    final isExpiring = msg.burnAt != null && remainingMs < 900;
+    // freshly-sent outgoing bubble: play a one-shot lift-in. the time window
+    // keeps it from re-firing on old bubbles when opening or scrolling a chat.
+    final justSent =
+        isOut &&
+        !msg.failed &&
+        DateTime.now().difference(msg.when).inMilliseconds < 900;
+    // an entrance plays once, gated on a seen-set keyed by uid
+    final entranceKey = msg.msgUid ?? '';
+    final alreadyPlayed = _Bubble._entered.contains(entranceKey);
+    final justArrived = !isOut && !msg.failed && msg.fresh && !alreadyPlayed;
+    final willAnimate = (justArrived || (isOut && msg.fresh && !alreadyPlayed));
+    if (willAnimate && entranceKey.isNotEmpty) {
+      _Bubble._entered.add(entranceKey);
+      // insertion-ordered set - drop the oldest so this never grows unbounded
+      if (_Bubble._entered.length > 400) {
+        _Bubble._entered.remove(_Bubble._entered.first);
+      }
+    }
+    // clear fresh after the entrance plays so a later rebuild can't replay
+    // it. this also covers messages that arrived without a uid.
+    if (msg.fresh && willAnimate) {
+      Future.delayed(const Duration(milliseconds: 650), () {
+        msg.fresh = false;
+      });
+    }
+    return AnimatedOpacity(
+      duration: Duration(milliseconds: isExpiring ? 440 : 250),
+      curve: UmbraMotion.easeOut,
+      opacity: dimmed ? 0.28 : 1.0,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: (failedShown || parked) && onRetry != null
+            ? () => onRetry!(msg)
+            : onReveal,
+        onLongPress: onLongPress == null ? null : () => onLongPress!(context),
+        child: Padding(
+          padding: EdgeInsets.only(
+            top: firstInGroup ? 4 : 1,
+            // a reaction hangs ~13px below the bubble. reserve room so the
+            // next message does not overlap and clip the pill.
+            bottom: msg.reactions.isNotEmpty ? 16 : (lastInGroup ? 4 : 1),
+          ),
+          child: Column(
+            crossAxisAlignment: isOut
+                ? CrossAxisAlignment.end
+                : CrossAxisAlignment.start,
+            children: [
+              _bubbleEntrance(
+                isOut: isOut,
+                active: isOut ? justSent : justArrived,
+                child: Stack(
+                  clipBehavior: Clip.none,
+                  children: [
+                    BurnFade(
+                      active: isExpiring,
+                      child: Container(
+                        constraints: BoxConstraints(
+                          maxWidth: MediaQuery.of(context).size.width * 0.78,
+                        ),
+                        padding: frameless
+                            ? EdgeInsets.zero
+                            : const EdgeInsets.fromLTRB(14, 10, 14, 8),
+                        decoration: BoxDecoration(
+                          color: (isImage && msg.text.isNotEmpty)
+                              ? colors.surfaceElevated
+                              : frameless
+                              ? null
+                              : isOut
+                              ? colors.accent
+                              : atmoBubbleIn(context),
+                          gradient: null,
+                          borderRadius: BorderRadiusDirectional.only(
+                            topStart: const Radius.circular(14),
+                            topEnd: const Radius.circular(14),
+                            bottomStart: Radius.circular(
+                              isOut ? 14 : (lastInGroup ? 4 : 14),
+                            ),
+                            bottomEnd: Radius.circular(
+                              isOut ? (lastInGroup ? 4 : 14) : 14,
+                            ),
+                          ),
+                          border: isCurrentMatch
+                              ? Border.all(color: colors.accent, width: 1)
+                              : null,
+                          boxShadow: isCurrentMatch
+                              ? [
+                                  BoxShadow(
+                                    color: colors.accent.withValues(
+                                      alpha: 0.28,
+                                    ),
+                                    blurRadius: 22,
+                                    spreadRadius: -4,
+                                    offset: const Offset(0, 6),
+                                  ),
+                                ]
+                              : null,
+                        ),
+                        clipBehavior: frameless ? Clip.antiAlias : Clip.none,
+                        child: IntrinsicWidth(
+                          child: Column(
+                            crossAxisAlignment: isOut
+                                ? CrossAxisAlignment.end
+                                : CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              if (quotedText != null)
+                                GestureDetector(
+                                  behavior: HitTestBehavior.opaque,
+                                  onTap: onQuoteTap,
+                                  child: Container(
+                                    margin: const EdgeInsets.only(bottom: 4),
+                                    clipBehavior: Clip.antiAlias,
+                                    decoration: BoxDecoration(
+                                      color: isOut
+                                          ? colors.accentOn.withValues(
+                                              alpha: 0.1,
+                                            )
+                                          : colors.accent.withValues(
+                                              alpha: 0.08,
+                                            ),
+                                      borderRadius: BorderRadius.circular(9),
+                                    ),
+                                    child: IntrinsicHeight(
+                                      child: Row(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.stretch,
+                                        mainAxisSize: MainAxisSize.max,
+                                        children: [
+                                          Container(
+                                            width: 3,
+                                            color: isOut
+                                                ? colors.accentOn.withValues(
+                                                    alpha: 0.7,
+                                                  )
+                                                : colors.accent,
+                                          ),
+                                          const SizedBox(width: 9),
+                                          Flexible(
+                                            child: Padding(
+                                              padding:
+                                                  const EdgeInsetsDirectional.fromSTEB(
+                                                    0,
+                                                    6,
+                                                    10,
+                                                    6,
+                                                  ),
+                                              child: Column(
+                                                crossAxisAlignment:
+                                                    CrossAxisAlignment.start,
+                                                mainAxisSize: MainAxisSize.min,
+                                                children: [
+                                                  if (quotedAuthor != null)
+                                                    Text(
+                                                      quotedAuthor!,
+                                                      style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: isOut
+                                                            ? colors.accentOn
+                                                                  .withValues(
+                                                                    alpha: 0.85, letterSpacing: 0.12)
+                                                            : colors.accent,
+                                                        letter: 0.4,
+                                                      ),
+                                                    ),
+                                                  if (quotedAuthor != null)
+                                                    const SizedBox(height: 2),
+                                                  Text(
+                                                    quotedText!,
+                                                    maxLines: 1,
+                                                    overflow:
+                                                        TextOverflow.ellipsis,
+                                                    style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 12.5, fontWeight: FontWeight.w400, color: isOut
+                                                          ? colors.accentOn
+                                                                .withValues(
+                                                                  alpha: 0.85, height: 1.5, letterSpacing: 0)
+                                                          : colors.textSecondary,
+                                                      height: 1.25,
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              if (msg.fileName == 'voice.wav' &&
+                                  msg.filePath != null)
+                                Padding(
+                                  padding: const EdgeInsets.symmetric(
+                                    vertical: 2,
+                                  ),
+                                  child: VoiceBubble(
+                                    key: ValueKey('vb_${msg.filePath}'),
+                                    path: msg.filePath!,
+                                    isOut: isOut,
+                                    disguised: msg.voiceDisguised,
+                                  ),
+                                )
+                              else if (msg.filePath != null &&
+                                  nameSaysVideo(msg.fileName))
+                                VideoBubble(
+                                  key: ValueKey('vid_${msg.filePath}'),
+                                  path: msg.filePath!,
+                                  fileName: msg.fileName!,
+                                  width:
+                                      (MediaQuery.of(context).size.width * 0.66)
+                                          .clamp(180.0, 300.0),
+                                  onOpen: () => openVideo(
+                                    context,
+                                    path: msg.filePath!,
+                                    fileName: msg.fileName,
+                                  ),
+                                  stamp: showMeta
+                                      ? _mediaStamp(
+                                          msg,
+                                          pending,
+                                          failedShown,
+                                          ackOk,
+                                        )
+                                      : null,
+                                )
+                              else if (msg.fileName != null)
+                                GestureDetector(
+                                  behavior: HitTestBehavior.opaque,
+                                  onTap: () {
+                                    if (msg.filePath != null) {
+                                      openReceivedFile(
+                                        context,
+                                        msg.filePath!,
+                                        msg.fileName,
+                                      );
+                                    }
+                                  },
+                                  child: Padding(
+                                    padding: const EdgeInsets.symmetric(
+                                      vertical: 2,
+                                    ),
+                                    child: _fileCard(msg, isOut),
+                                  ),
+                                ),
+                              if (msg.mediaPath != null)
+                                GestureDetector(
+                                  onTap: () => _openFullImage(
+                                    context,
+                                    msg.mediaPath!,
+                                    secure: msg.secure,
+                                  ),
+                                  child: ClipRRect(
+                                    borderRadius: msg.text.isNotEmpty
+                                        ? const BorderRadius.vertical(
+                                            top: Radius.circular(14),
+                                          )
+                                        : BorderRadius.circular(14),
+                                    child: Stack(
+                                      clipBehavior: Clip.none,
+                                      children: [
+                                        ConstrainedBox(
+                                          constraints: const BoxConstraints(
+                                            maxHeight: 280,
+                                          ),
+                                          // the bubble sizes itself with
+                                          // IntrinsicWidth, and an Image
+                                          // answers infinity until the file
+                                          // decodes, so pin a width
+                                          child: RememberedHeight(
+                                            id: msg.mediaPath!,
+                                            child: SizedBox(
+                                              width:
+                                                  MediaQuery.of(
+                                                    context,
+                                                  ).size.width *
+                                                  0.78,
+                                              child: Image.file(
+                                                File(msg.mediaPath!),
+                                                gaplessPlayback: true,
+                                                fit: BoxFit.cover,
+                                                cacheWidth: screenPx(
+                                                  context,
+                                                  times: 0.78,
+                                                ),
+                                                errorBuilder: (_, e, _) {
+                                                  dlog(
+                                                    'Image failed: '
+                                                    '${msg.mediaPath} / $e',
+                                                  );
+                                                  return Container(
+                                                    height: 120,
+                                                    alignment: Alignment.center,
+                                                    color: Colors.black26,
+                                                    child: Text(
+                                                      l10n.chatPhotoUnavailable,
+                                                      style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11, fontWeight: FontWeight.w500, color: colors.textSecondary, letterSpacing: 0.12),
+                                                    ),
+                                                  );
+                                                },
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                        if (showMeta)
+                                          PositionedDirectional(
+                                            end: 8,
+                                            bottom: 8,
+                                            child: _mediaStamp(
+                                              msg,
+                                              pending,
+                                              failedShown,
+                                              ackOk,
+                                            ),
+                                          ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              Padding(
+                                padding: msg.mediaPath != null
+                                    ? (msg.text.isNotEmpty
+                                          ? const EdgeInsets.fromLTRB(
+                                              12,
+                                              8,
+                                              12,
+                                              10,
+                                            )
+                                          : const EdgeInsets.fromLTRB(
+                                              2,
+                                              6,
+                                              2,
+                                              0,
+                                            ))
+                                    : EdgeInsets.zero,
+                                child: Column(
+                                  crossAxisAlignment: msg.mediaPath != null
+                                      ? CrossAxisAlignment.start
+                                      : CrossAxisAlignment.end,
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    if (msg.text.isNotEmpty)
+                                      _body(
+                                        isOut,
+                                        image: msg.mediaPath != null,
+                                      ),
+                                    if (firstUrl(msg.text) case final u?) ...[
+                                      const SizedBox(height: 6),
+                                      LinkStub(
+                                        url: u,
+                                        isOut: isOut,
+                                        title: linkTitle,
+                                        bySender: linkBySender,
+                                      ),
+                                    ],
+                                    if (showMeta && !frameless) ...[
+                                      const SizedBox(height: 4),
+                                      Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          if (msg.secure) ...[
+                                            Icon(
+                                              Icons.shield_rounded,
+                                              size: 10,
+                                              color: metaColor,
+                                            ),
+                                            const SizedBox(width: 4),
+                                          ],
+                                          Text(
+                                            _fmtTime(msg.when),
+                                            style: TextStyle(
+                                              fontFamily: UmbraTypography.fontMono,
+                                              fontFamilyFallback:
+                                                  HaloType.monoFallbackNow,
+                                              fontSize: 9,
+                                              color: metaColor,
+                                              letterSpacing: track(0.4),
+                                            ),
+                                          ),
+                                          if (msg.edited) ...[
+                                            const SizedBox(width: 5),
+                                            Text(
+                                              l10n.chatEdited,
+                                              style: TextStyle(
+                                                fontFamily: UmbraTypography.fontMono,
+                                                fontFamilyFallback:
+                                                    HaloType.monoFallbackNow,
+                                                fontSize: 9,
+                                                color: metaColor,
+                                                fontStyle: slant(),
+                                                letterSpacing: track(0.4),
+                                              ),
+                                            ),
+                                          ],
+                                          const SizedBox(width: 3),
+                                          Text(
+                                            '✓',
+                                            style: TextStyle(
+                                              fontSize: 11,
+                                              color: metaColor,
+                                              fontWeight: FontWeight.w700,
+                                              height: 1,
+                                            ),
+                                          ),
+                                          if (msg.delivered) ...[
+                                            const SizedBox(width: 4),
+                                            Text(
+                                              l10n.chatDelivered,
+                                              style: TextStyle(
+                                                fontFamily: UmbraTypography.fontMono,
+                                                fontFamilyFallback:
+                                                    HaloType.monoFallbackNow,
+                                                fontSize: 8.5,
+                                                fontWeight: FontWeight.w600,
+                                                color: metaColor,
+                                                letterSpacing: track(0.3),
+                                              ),
+                                            ),
+                                          ],
+                                          if (msg.burnAt != null) ...[
+                                            const SizedBox(width: 6),
+                                            Icon(
+                                              Icons
+                                                  .local_fire_department_outlined,
+                                              size: 11,
+                                              color: metaColor,
+                                            ),
+                                            const SizedBox(width: 2),
+                                            Text(
+                                              _fmtBurn(msg.burnAt!),
+                                              style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 9.5, fontWeight: FontWeight.w600, color: metaColor, letterSpacing: 0.12),
+                                            ),
+                                          ],
+                                        ],
+                                      ),
+                                    ],
+                                    if (!isOut &&
+                                        msg.edited &&
+                                        msg.mediaPath == null) ...[
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        l10n.chatEdited,
+                                        style: TextStyle(
+                                          fontFamily: UmbraTypography.fontMono,
+                                          fontFamilyFallback:
+                                              HaloType.monoFallbackNow,
+                                          fontSize: 9,
+                                          color: colors.accent.withValues(
+                                            alpha: 0.55,
+                                          ),
+                                          fontStyle: slant(),
+                                          letterSpacing: track(0.4),
+                                        ),
+                                      ),
+                                    ],
+
+                                    // a sent photo has no meta row, so its
+                                    // countdown lives here like an incoming one
+                                    if (msg.burnAt != null &&
+                                        !pending &&
+                                        (!showMeta ||
+                                            msg.mediaPath != null)) ...[
+                                      const SizedBox(height: 4),
+                                      Padding(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 4,
+                                        ),
+                                        child: Row(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            Icon(
+                                              Icons
+                                                  .local_fire_department_outlined,
+                                              size: 11,
+                                              color: (isOut && !isImage)
+                                                  ? colors.accentOn
+                                                  : colors.accent.withValues(
+                                                      alpha: 0.75,
+                                                    ),
+                                            ),
+                                            const SizedBox(width: 4),
+                                            Text(
+                                              _fmtBurn(msg.burnAt!),
+                                              style:
+                                                  TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 9.5, fontWeight: FontWeight.w500, color: (isOut && !isImage, letterSpacing: 0.12)
+                                                        ? colors.accentOn
+                                                        : colors.accent
+                                                              .withValues(
+                                                                alpha: 0.75,
+                                                              ),
+                                                    weight: FontWeight.w600,
+                                                  ).copyWith(
+                                                    letterSpacing: track(0.3),
+                                                  ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    ],
+                                    if (failedShown || parked) ...[
+                                      const SizedBox(height: 4),
+                                      Text(
+                                        parked
+                                            ? l10n.chatWaitingForThemToComeOnline
+                                            : l10n.chatFailedTapToRetry,
+                                        style: TextStyle(
+                                          fontFamily: UmbraTypography.fontMono,
+                                          fontFamilyFallback:
+                                              HaloType.monoFallbackNow,
+                                          fontSize: 10,
+                                          color: colors.accentOn.withValues(
+                                            alpha: 0.95,
+                                          ),
+                                          letterSpacing: track(0.4),
+                                        ),
+                                      ),
+                                    ],
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                    if (msg.reactions.isNotEmpty)
+                      PositionedDirectional(
+                        // hangs below the bubble on the sender's side. keyed
+                        // off direction, so groups work the same.
+                        bottom: -13,
+                        end: isOut ? 10 : null,
+                        start: isOut ? null : 10,
+                        child: Wrap(
+                          spacing: 3,
+                          children: _buildReactionChips(msg),
+                        ),
+                      ),
+                    if (ripple)
+                      Positioned.fill(
+                        child: IgnorePointer(
+                          child: TweenAnimationBuilder<double>(
+                            tween: Tween(begin: 0.0, end: 1.0),
+                            duration: const Duration(milliseconds: 820),
+                            curve: UmbraMotion.easeOut,
+                            builder: (context, t, child) => Opacity(
+                              opacity: (1 - t) * 0.92,
+                              child: Transform.scale(
+                                scale: 1 + t * 0.16,
+                                child: Container(
+                                  decoration: BoxDecoration(
+                                    borderRadius: BorderRadiusDirectional.only(
+                                      topStart: const Radius.circular(14),
+                                      topEnd: const Radius.circular(14),
+                                      bottomStart: Radius.circular(
+                                        isOut ? 14 : (lastInGroup ? 4 : 14),
+                                      ),
+                                      bottomEnd: Radius.circular(
+                                        isOut ? (lastInGroup ? 4 : 14) : 14,
+                                      ),
+                                    ),
+                                    border: Border.all(
+                                      color: colors.accent,
+                                      width: 2,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+              if (revealed)
+                Padding(
+                  // a reaction pill hangs ~13px below the bubble. when the
+                  // timestamp reveals, push it clear so they don't overlap.
+                  padding: EdgeInsets.only(
+                    top: msg.reactions.isNotEmpty ? 16 : 4,
+                    left: 4,
+                    right: 4,
+                  ),
+                  child: Text(
+                    _fmtFull(msg.when),
+                    style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 9.5, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.3),
+                  ),
+                ),
+              if (showPill) ...[
+                const SizedBox(height: 4),
+                Padding(
+                  padding: const EdgeInsetsDirectional.only(end: 4),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (msg.msgUid != null &&
+                          (msg.mediaPath != null || msg.filePath != null)) ...[
+                        SendProgressLabel(msgUid: msg.msgUid!),
+                        const SizedBox(width: 6),
+                      ],
+                      SendPill(mode: _pmFrom(appState.sendMode)),
+                    ],
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // one chip per emoji, with a count when more than one
+  List<Widget> _buildReactionChips(_Msg m) {
+    final counts = <String, int>{};
+    for (final emoji in m.reactions.values) {
+      counts[emoji] = (counts[emoji] ?? 0) + 1;
+    }
+    return counts.entries.map<Widget>((e) {
+      final emoji = e.key;
+      final count = e.value;
+      return _ReactionPop(
+        key: ValueKey(emoji),
+        popKey: '${m.msgUid}:$emoji',
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+          decoration: BoxDecoration(
+            // the colour of the chat background, so it reads as a tab cut
+            // below the bubble, not a smudge on top
+            color: colors.ink,
+            borderRadius: BorderRadius.circular(11),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(emoji, style: const TextStyle(fontSize: 13, height: 1.2)),
+              if (count > 1) ...[
+                const SizedBox(width: 3),
+                Text(
+                  '$count',
+                  style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w600, color: colors.textSecondary, letterSpacing: 0.12),
+                ),
+              ],
+            ],
+          ),
+        ),
+      );
+    }).toList();
+  }
+}
+
+// a reaction chip springing onto the bubble when added. keyed by emoji so
+// existing chips keep their state and only a new one animates.
+class _ReactionPop extends StatefulWidget {
+  final Widget child;
+  final String popKey;
+  const _ReactionPop({super.key, required this.child, required this.popKey});
+
+  // chips that already played their pop, so a rebuild does not spring every
+  // reaction in again
+  static final Set<String> _popped = {};
+
+  @override
+  State<_ReactionPop> createState() => _ReactionPopState();
+}
+
+class _ReactionPopState extends State<_ReactionPop>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 280),
+  );
+
+  @override
+  void initState() {
+    super.initState();
+    if (_ReactionPop._popped.contains(widget.popKey)) {
+      _c.value = 1.0; // already played: render settled
+    } else {
+      _ReactionPop._popped.add(widget.popKey);
+      _c.forward();
+    }
+  }
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return FadeTransition(
+      opacity: CurvedAnimation(
+        parent: _c,
+        curve: const Interval(0, 0.5, curve: UmbraMotion.easeOut),
+      ),
+      child: ScaleTransition(
+        scale: TweenSequence<double>([
+          TweenSequenceItem(
+            tween: Tween(
+              begin: 0.0,
+              end: 1.18,
+            ).chain(CurveTween(curve: UmbraMotion.easeOut)),
+            weight: 62,
+          ),
+          TweenSequenceItem(
+            tween: Tween(
+              begin: 1.18,
+              end: 1.0,
+            ).chain(CurveTween(curve: Curves.easeInOut)),
+            weight: 38,
+          ),
+        ]).animate(_c),
+        child: widget.child,
+      ),
+    );
+  }
+}
+
+// an emoji button in the reaction pill
+class _EmojiTap extends StatefulWidget {
+  final String emoji;
+  final bool selected;
+  final VoidCallback onTap;
+  const _EmojiTap({
+    required this.emoji,
+    required this.selected,
+    required this.onTap,
+  });
+  @override
+  State<_EmojiTap> createState() => _EmojiTapState();
+}
+
+class _EmojiTapState extends State<_EmojiTap> {
+  double _scale = 1.0;
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return GestureDetector(
+      onTapDown: (_) => setState(() => _scale = 0.85),
+      onTapUp: (_) {
+        setState(() => _scale = 1.0);
+        widget.onTap();
+      },
+      onTapCancel: () => setState(() => _scale = 1.0),
+      child: AnimatedScale(
+        scale: _scale,
+        duration: const Duration(milliseconds: 90),
+        curve: UmbraMotion.easeOut,
+        child: Container(
+          width: 46,
+          height: 46,
+          decoration: BoxDecoration(
+            color: widget.selected ? colors.accentSoft : colors.surfaceHover,
+            border: Border.all(
+              color: widget.selected ? colors.accent : colors.separator,
+              width: 0.5,
+            ),
+            borderRadius: BorderRadius.circular(UmbraRadius.xl),
+          ),
+          alignment: Alignment.center,
+          child: Text(widget.emoji, style: const TextStyle(fontSize: 24)),
+        ),
+      ),
+    );
+  }
+}
+
+// above the composer while writing a reply: a snippet of the target and an
+// X to cancel
+class _ReplyQuoteBar extends StatelessWidget {
+  final _Msg target;
+  final VoidCallback onCancel;
+  const _ReplyQuoteBar({required this.target, required this.onCancel});
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return Container(
+      padding: const EdgeInsetsDirectional.fromSTEB(14, 8, 8, 8),
+      decoration: BoxDecoration(
+        color: colors.surfaceElevated,
+        border: Border(top: BorderSide(color: colors.separator, width: 0.5)),
+      ),
+      child: Row(
+        children: [
+          // amber accent stripe to mark this as a quote
+          Container(
+            width: 2.5,
+            height: 32,
+            margin: const EdgeInsetsDirectional.only(end: 10),
+            decoration: BoxDecoration(
+              color: colors.accent,
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  target.direction == 'out'
+                      ? l10n.chatReplyingToYourself
+                      : l10n.chatReplyingTo,
+                  style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 9.5, fontWeight: FontWeight.w500, color: colors.accent, letterSpacing: 0.6),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  target.text,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.3, letterSpacing: 0),
+                ),
+              ],
+            ),
+          ),
+          IconButton(
+            tooltip: l10n.commonClose,
+            iconSize: 18,
+            padding: EdgeInsets.zero,
+            constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+            color: colors.textTertiary,
+            icon: const Icon(Icons.close),
+            onPressed: onCancel,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// the reaction pill above the long-pressed bubble
+class _EmojiPickerBubble extends StatefulWidget {
+  final List<String> emojis;
+  final String? selected;
+  final void Function(String) onPick;
+  final VoidCallback onReply;
+  const _EmojiPickerBubble({
+    required this.emojis,
+    required this.selected,
+    required this.onPick,
+    required this.onReply,
+  });
+
+  @override
+  State<_EmojiPickerBubble> createState() => _EmojiPickerBubbleState();
+}
+
+class _EmojiPickerBubbleState extends State<_EmojiPickerBubble>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _ctrl;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(
+      vsync: this,
+      duration: const UmbraMotion.durationNormal,
+    )..forward();
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    // same growth as the menu under it, so the two read as one thing
+    final scale = Tween<double>(
+      begin: 0.8,
+      end: 1.0,
+    ).chain(CurveTween(curve: Curves.easeOutBack)).animate(_ctrl);
+    return Material(
+      color: Colors.transparent,
+      child: ScaleTransition(
+        scale: scale,
+        alignment: Alignment.bottomCenter,
+        child: FadeTransition(
+          opacity: _ctrl,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
+            decoration: BoxDecoration(
+              color: colors.surfaceHover,
+              border: Border.all(color: colors.separator, width: 0.5),
+              borderRadius: BorderRadius.circular(30),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.5),
+                  blurRadius: 28,
+                  offset: const Offset(0, 10),
+                ),
+              ],
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                ...widget.emojis.asMap().entries.map((entry) {
+                  final i = entry.key;
+                  final e = entry.value;
+                  final n = widget.emojis.length;
+                  final start = (i / n) * 0.55;
+                  final pop = CurvedAnimation(
+                    parent: _ctrl,
+                    curve: Interval(
+                      start,
+                      (start + 0.45).clamp(0.0, 1.0),
+                      curve: Curves.easeOutBack,
+                    ),
+                  );
+                  return ScaleTransition(
+                    scale: pop,
+                    child: _EmojiTap(
+                      emoji: e,
+                      selected: e == widget.selected,
+                      onTap: () => widget.onPick(e),
+                    ),
+                  );
+                }),
+                Container(
+                  width: 0.5,
+                  height: 28,
+                  margin: const EdgeInsets.symmetric(horizontal: 4),
+                  color: colors.separatorStrong,
+                ),
+                Semantics(
+                  label: l10n.chatReply,
+                  button: true,
+                  child: _ActionTap(
+                    icon: Icons.reply_rounded,
+                    onTap: widget.onReply,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// an icon button in the reaction pill, drawn like _EmojiTap
+class _ActionTap extends StatefulWidget {
+  final IconData icon;
+  final VoidCallback onTap;
+  const _ActionTap({required this.icon, required this.onTap});
+  @override
+  State<_ActionTap> createState() => _ActionTapState();
+}
+
+class _ActionTapState extends State<_ActionTap> {
+  double _scale = 1.0;
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return GestureDetector(
+      onTapDown: (_) => setState(() => _scale = 0.85),
+      onTapUp: (_) {
+        setState(() => _scale = 1.0);
+        widget.onTap();
+      },
+      onTapCancel: () => setState(() => _scale = 1.0),
+      child: AnimatedScale(
+        scale: _scale,
+        duration: const Duration(milliseconds: 90),
+        curve: UmbraMotion.easeOut,
+        child: Container(
+          width: 46,
+          height: 46,
+          decoration: BoxDecoration(
+            color: colors.surfaceHover,
+            border: Border.all(color: colors.separator, width: 0.5),
+            borderRadius: BorderRadius.circular(UmbraRadius.xl),
+          ),
+          alignment: Alignment.center,
+          child: Icon(widget.icon, size: 20, color: colors.accent),
+        ),
+      ),
+    );
+  }
+}
+
+class _EmptyConversation extends StatelessWidget {
+  const _EmptyConversation();
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return Center(
+      child: TweenAnimationBuilder<double>(
+        tween: Tween(begin: 0.0, end: 1.0),
+        duration: const Duration(milliseconds: 650),
+        curve: UmbraMotion.easeOut,
+        builder: (context, t, child) => Opacity(
+          opacity: t.clamp(0.0, 1.0),
+          child: Transform.translate(
+            offset: Offset(0, (1 - t) * 12),
+            child: child,
+          ),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.all(40),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 60,
+                height: 60,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: colors.accentSoft,
+                  border: Border.all(
+                    color: colors.accent.withValues(alpha: 0.3),
+                    width: 0.5,
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: colors.accent.withValues(alpha: 0.18),
+                      blurRadius: 28,
+                      spreadRadius: 2,
+                    ),
+                  ],
+                ),
+                child: Icon(
+                  Icons.lock_outline_rounded,
+                  color: colors.accent,
+                  size: 25,
+                ),
+              ),
+              const SizedBox(height: 20),
+              Text(
+                l10n.chatSayHi,
+                textAlign: TextAlign.center,
+                style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 24, fontWeight: FontWeight.w300, color: colors.textPrimary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                l10n.chatJustTheTwoOf,
+                textAlign: TextAlign.center,
+                style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// pitch-shift a 16-bit pcm wav so the voice is harder to recognize.
+// resamples the body by a fixed ratio then plays it back at the original
+// rate. moves pitch and formants together (not formant-preserving), so
+// label it "harder to recognize", never "anonymous".
+Uint8List disguiseWav(Uint8List wav) {
+  if (wav.length < 44) return wav;
+  // wav header is 44 bytes; samples are 16-bit little-endian after it.
+  const headerLen = 44;
+  final header = wav.sublist(0, headerLen);
+  final body = wav.buffer.asInt16List(
+    wav.offsetInBytes + headerLen,
+    (wav.length - headerLen) ~/ 2,
+  );
+  // ratio < 1 keeps more samples = lower, slower-sounding voice once
+  // played at the original rate. 0.76 is a clear drop that still reads as
+  // speech.
+  const ratio = 0.76;
+  final outLen = (body.length / ratio).floor();
+  final out = Int16List(outLen);
+  for (var i = 0; i < outLen; i++) {
+    final srcF = i * ratio;
+    final i0 = srcF.floor();
+    final i1 = (i0 + 1 < body.length) ? i0 + 1 : i0;
+    final frac = srcF - i0;
+    out[i] = (body[i0] * (1 - frac) + body[i1] * frac).round();
+  }
+  final outBytes = out.buffer.asUint8List();
+  // patch the two little-endian length fields in the header to match.
+  final result = Uint8List(headerLen + outBytes.length);
+  result.setRange(0, headerLen, header);
+  result.setRange(headerLen, result.length, outBytes);
+  final dataLen = outBytes.length;
+  final riffLen = 36 + dataLen;
+  result[4] = riffLen & 0xff;
+  result[5] = (riffLen >> 8) & 0xff;
+  result[6] = (riffLen >> 16) & 0xff;
+  result[7] = (riffLen >> 24) & 0xff;
+  result[40] = dataLen & 0xff;
+  result[41] = (dataLen >> 8) & 0xff;
+  result[42] = (dataLen >> 16) & 0xff;
+  result[43] = (dataLen >> 24) & 0xff;
+  return result;
+}
+
+class _HoldToTalkMic extends StatefulWidget {
+  final bool disguise;
+  final VoidCallback onToggleDisguise;
+  final void Function(String path, int ms, bool cancelled) onComplete;
+  const _HoldToTalkMic({
+    required this.disguise,
+    required this.onToggleDisguise,
+    required this.onComplete,
+  });
+  @override
+  State<_HoldToTalkMic> createState() => _HoldToTalkMicState();
+}
+
+class _HoldToTalkMicState extends State<_HoldToTalkMic> {
+  final _rec = AudioRecorder();
+  OverlayEntry? _overlay;
+  Timer? _ticker;
+  int _ms = 0;
+  bool _willCancel = false;
+  double _dragDx = 0;
+  bool _busy = false;
+  bool _live = false;
+  String? _path;
+  double _bottomInset = 0;
+  // the keyboard's height when the hold began: the bar is in the root
+  // overlay, which never sees the keyboard
+  double _keyboardInset = 0;
+
+  @override
+  void dispose() {
+    _recUnguard?.call();
+    _ticker?.cancel();
+    _overlay?.remove();
+    _rec.dispose();
+    super.dispose();
+  }
+
+  Future<void> _start() async {
+    if (_busy) return;
+    _busy = true;
+    // _busy is cleared in finally: a throw that left it set would kill the
+    // mic until the chat is reopened
+    try {
+      if (!await _rec.hasPermission()) {
+        if (mounted) showHaloToast(context, l10n.chatMicPermissionNeeded);
+        return;
+      }
+      // the permission prompt eats the long-press: by the time the user
+      // grants, the finger is gone and nothing would ever stop the
+      // recording. bail out and let them hold again.
+      if (!_live) return;
+      final dir = await getTemporaryDirectory();
+      final path =
+          '${dir.path}/vn_${DateTime.now().millisecondsSinceEpoch}.wav';
+      await _rec.start(
+        const RecordConfig(
+          encoder: AudioEncoder.wav,
+          sampleRate: 16000,
+          numChannels: 1,
+        ),
+        path: path,
+      );
+      _path = path;
+      // the finger came up while the recorder was starting. _end already ran
+      // and found nothing to stop, so without this the mic would keep going
+      // with no hold behind it.
+      if (!_live) {
+        final p = await _rec.stop();
+        await shredFile(p ?? path);
+        _path = null;
+        return;
+      }
+      _ms = 0;
+      _willCancel = false;
+      _dragDx = 0;
+      HapticFeedback.mediumImpact();
+      _ticker = Timer.periodic(const UmbraMotion.durationFast, (_) {
+        _ms += 100;
+        _overlay?.markNeedsBuild();
+      });
+      if (mounted) {
+        // the scaffold strips the keyboard inset from its body's media
+        // query, so it has to come from the view itself or it reads as zero
+        final view = MediaQueryData.fromView(View.of(context));
+        _bottomInset = view.padding.bottom;
+        _keyboardInset = view.viewInsets.bottom;
+      }
+      _overlay = OverlayEntry(builder: (_) => _bar());
+      if (mounted) Overlay.of(context).insert(_overlay!);
+      // the lock stops the recording and throws it away
+      _recUnguard = lockGuard.closeOnLock(_abort);
+    } catch (e) {
+      dlog('voice: could not start: $e');
+      _ticker?.cancel();
+      _ticker = null;
+      _overlay?.remove();
+      _overlay = null;
+      final p = _path;
+      _path = null;
+      if (p != null) shredFile(p).ignore();
+      if (mounted) showHaloToast(context, l10n.chatTheMicWouldNot);
+    } finally {
+      _busy = false;
+    }
+  }
+
+  Future<void> _end() async {
+    // still starting: _start sees the finger is gone and cleans up itself
+    if (_busy) return;
+    _recUnguard?.call();
+    _recUnguard = null;
+    if (_ticker == null && _overlay == null) return;
+    _ticker?.cancel();
+    _ticker = null;
+    _overlay?.remove();
+    _overlay = null;
+    final path = await _rec.stop();
+    final ms = _ms;
+    final cancel = _willCancel || ms < 400;
+    if (cancel) {
+      final p = path ?? _path;
+      if (p != null) {
+        // a cancelled note is still a recording of a voice: shredded
+        await shredFile(p);
+      }
+      HapticFeedback.lightImpact();
+      widget.onComplete('', 0, true);
+      return;
+    }
+    HapticFeedback.mediumImpact();
+    widget.onComplete(path ?? _path ?? '', ms, false);
+  }
+
+  VoidCallback? _recUnguard;
+
+  // kill the recording from the bar itself - covers any state where the
+  // finger isn't down anymore but the mic is still going.
+  void _abort() {
+    _willCancel = true;
+    _end();
+  }
+
+  String get _time {
+    final s = _ms ~/ 1000;
+    final m = s ~/ 60;
+    return '${whole(m)}:${twoDigits(s % 60)}';
+  }
+
+  Widget _bar() {
+    final cancel = _willCancel;
+    // fade the slide hint out as the finger approaches the cancel threshold.
+    final slideProgress = (_dragDx / -90).clamp(0.0, 1.0);
+    return Positioned(
+      left: 0,
+      right: 0,
+      bottom: _keyboardInset,
+      child: TweenAnimationBuilder<double>(
+        tween: Tween(begin: 0.0, end: 1.0),
+        duration: const Duration(milliseconds: 180),
+        curve: UmbraMotion.easeOut,
+        builder: (_, t, child) => Opacity(
+          opacity: t,
+          child: Transform.translate(
+            offset: Offset(0, (1 - t) * 44),
+            child: child,
+          ),
+        ),
+        child: Material(
+          color: Colors.transparent,
+          child: Container(
+            padding: EdgeInsets.fromLTRB(18, 16, 18, 16 + _bottomInset),
+            decoration: BoxDecoration(
+              color: colors.surface,
+              border: Border(
+                top: BorderSide(
+                  color: cancel ? colors.error : colors.separator,
+                  width: 0.8,
+                ),
+              ),
+            ),
+            child: Row(
+              children: [
+                // pulsing record dot
+                TweenAnimationBuilder<double>(
+                  key: const ValueKey('rec-dot'),
+                  tween: Tween(begin: 0.4, end: 1.0),
+                  duration: const Duration(milliseconds: 650),
+                  curve: Curves.easeInOut,
+                  builder: (_, v, _) => Opacity(
+                    opacity: cancel ? 1.0 : v,
+                    child: Container(
+                      width: 11,
+                      height: 11,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: colors.error,
+                      ),
+                    ),
+                  ),
+                  onEnd: () => _overlay?.markNeedsBuild(),
+                ),
+                const SizedBox(width: 12),
+                Text(
+                  _time,
+                  style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 14, fontWeight: FontWeight.w500, color: colors.textPrimary, letterSpacing: 0.12),
+                ),
+                Expanded(
+                  child: cancel
+                      ? Center(
+                          child: Text(
+                            l10n.chatReleaseToCancel,
+                            style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 12, fontWeight: FontWeight.w500, color: colors.error, letterSpacing: 0.12),
+                          ),
+                        )
+                      : Transform.translate(
+                          offset: Offset(_dragDx * 0.5, 0),
+                          child: Opacity(
+                            opacity: (1 - slideProgress * 0.7),
+                            child: Row(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: widget.disguise
+                                  ? [
+                                      Icon(
+                                        Icons.theater_comedy_outlined,
+                                        size: 14,
+                                        color: colors.accent,
+                                      ),
+                                      const SizedBox(width: 6),
+                                      Text(
+                                        l10n.chatVoiceHiddenSlideTo,
+                                        style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11, fontWeight: FontWeight.w500, color: colors.accent, letterSpacing: 0.12),
+                                      ),
+                                    ]
+                                  : [
+                                      Icon(
+                                        Icons.chevron_left,
+                                        size: 16,
+                                        color: colors.textTertiary,
+                                      ),
+                                      Text(
+                                        l10n.chatSlideToCancel,
+                                        style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.12),
+                                      ),
+                                    ],
+                            ),
+                          ),
+                        ),
+                ),
+                Semantics(
+                  label: l10n.commonClose,
+                  button: true,
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: _abort,
+                    child: Padding(
+                      padding: const EdgeInsetsDirectional.only(start: 8),
+                      child: Icon(
+                        Icons.close_rounded,
+                        size: 20,
+                        color: colors.textSecondary,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onLongPressStart: (_) {
+        _live = true;
+        _start();
+      },
+      onLongPressMoveUpdate: (d) {
+        _dragDx = d.offsetFromOrigin.dx.clamp(-160.0, 0.0);
+        final wc = d.offsetFromOrigin.dx < -90;
+        if (wc != _willCancel) {
+          _willCancel = wc;
+          if (wc) HapticFeedback.mediumImpact();
+        }
+        _overlay?.markNeedsBuild();
+      },
+      onLongPressEnd: (_) {
+        _live = false;
+        _end();
+      },
+      child: Icon(Icons.mic_none_rounded, size: 22, color: colors.textSecondary),
+    );
+  }
+}
+
+class _Composer extends StatelessWidget {
+  final TextEditingController controller;
+  final bool sending;
+  final VoidCallback onSend;
+  final bool ghost;
+  final VoidCallback onToggleGhost;
+  final bool secure;
+  final VoidCallback onToggleSecure;
+  final VoidCallback onPickBurn;
+  final int burnSeconds;
+  final VoidCallback onAttach;
+  final VoidCallback onCamera;
+  final bool disguise;
+  final VoidCallback onToggleDisguise;
+  final void Function(String path, int ms, bool cancelled) onVoiceComplete;
+
+  const _Composer({
+    required this.controller,
+    required this.sending,
+    required this.onSend,
+    required this.ghost,
+    required this.onToggleGhost,
+    required this.secure,
+    required this.onToggleSecure,
+    required this.onPickBurn,
+    required this.burnSeconds,
+    required this.onAttach,
+    required this.onCamera,
+    required this.disguise,
+    required this.onToggleDisguise,
+    required this.onVoiceComplete,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    // a phone whose identity has moved has no engine running: a message
+    // typed here would sit in the outbox for good. nowhere to type it.
+    if (appState.movedAway) return const MovedStrip();
+    return AnimatedContainer(
+      duration: const UmbraMotion.durationNormal,
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+      decoration: BoxDecoration(
+        border: Border(
+          top: BorderSide(
+            color: ghost
+                ? colors.accent.withValues(alpha: 0.6)
+                : colors.separator,
+            width: ghost ? 0.8 : 0.5,
+          ),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          AnimatedSwitcher(
+            duration: const Duration(milliseconds: 220),
+            switchInCurve: UmbraMotion.easeOut,
+            switchOutCurve: UmbraMotion.easeSharp,
+            transitionBuilder: (child, anim) => SizeTransition(
+              sizeFactor: anim,
+              axisAlignment: -1,
+              child: FadeTransition(opacity: anim, child: child),
+            ),
+            child: ghost
+                ? Padding(
+                    key: const ValueKey('ghost-banner'),
+                    padding: const EdgeInsets.only(
+                      left: 4,
+                      right: 4,
+                      bottom: 10,
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(
+                          Icons.local_fire_department_outlined,
+                          size: 13,
+                          color: colors.accent,
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          l10n.chatGhostMode,
+                          style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 12, fontWeight: FontWeight.w400, color: colors.accent, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          l10n.chatMessagesBurnAfter(_humanBurn(burnSeconds)),
+                          style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10.5, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.12),
+                        ),
+                      ],
+                    ),
+                  )
+                : const SizedBox.shrink(),
+          ),
+          Row(
+            children: [
+              PressScale(
+                label: l10n.chatTimedMessages,
+                onTap: onToggleGhost,
+                onLongPress: onPickBurn,
+                scale: 0.88,
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 220),
+                  width: 32,
+                  height: 32,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: ghost ? colors.accent : colors.surfaceHover,
+                    boxShadow: ghost
+                        ? [
+                            BoxShadow(
+                              color: colors.accent.withValues(alpha: 0.45),
+                              blurRadius: 12,
+                              spreadRadius: 1,
+                            ),
+                          ]
+                        : null,
+                  ),
+                  alignment: Alignment.center,
+                  child: Icon(
+                    Icons.local_fire_department_outlined,
+                    size: 18,
+                    color: ghost ? colors.accentOn : colors.textSecondary,
+                  ),
+                ),
+              ),
+              // the shield toggle stays hidden until it is verified end to
+              // end. the flag, the wire and the viewer are all in place.
+              const SizedBox(width: 10),
+              // the camera that keeps its photos inside kryfo
+              PressScale(
+                label: l10n.chatOpenTheCamera,
+                onTap: onCamera,
+                scale: 0.86,
+                child: Icon(
+                  Icons.photo_camera_outlined,
+                  size: 22,
+                  color: colors.textSecondary,
+                ),
+              ),
+              const SizedBox(width: 10),
+              PressScale(
+                label: l10n.chatAttachAPhoto,
+                onTap: onAttach,
+                scale: 0.86,
+                child: Icon(
+                  Icons.add_photo_alternate_outlined,
+                  size: 22,
+                  color: colors.textSecondary,
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: TextField(
+                  controller: controller,
+                  style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w400, height: 1.5, letterSpacing: 0),
+                  minLines: 1,
+                  maxLines: 4,
+                  decoration: InputDecoration(
+                    hintText: l10n.chatMessage,
+                    hintStyle: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w400, color: colors.textTertiary, height: 1.5, letterSpacing: 0),
+                    isDense: true,
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 10,
+                    ),
+                    filled: true,
+                    fillColor: colors.surfaceElevated,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(UmbraRadius.radius2xl),
+                      borderSide: BorderSide.none,
+                    ),
+                    enabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(UmbraRadius.radius2xl),
+                      borderSide: BorderSide.none,
+                    ),
+                    focusedBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(UmbraRadius.radius2xl),
+                      borderSide: BorderSide(
+                        color: colors.accent,
+                        width: 0.5,
+                      ),
+                    ),
+                  ),
+                  onSubmitted: (_) => onSend(),
+                ),
+              ),
+              const SizedBox(width: 10),
+              ValueListenableBuilder<TextEditingValue>(
+                valueListenable: controller,
+                builder: (context, value, _) {
+                  final hasText = value.text.trim().isNotEmpty;
+                  final canSend = !sending && hasText;
+                  // mic and send trade places with a small pop instead of a cut
+                  final Widget end = (!hasText && !sending)
+                      ? KeyedSubtree(
+                          key: const ValueKey('mic'),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Semantics(
+                                label: l10n.chatDisguiseVoice,
+                                button: true,
+                                child: GestureDetector(
+                                  onTap: onToggleDisguise,
+                                  behavior: HitTestBehavior.opaque,
+                                  child: Padding(
+                                    padding: const EdgeInsetsDirectional.only(
+                                      end: 12,
+                                    ),
+                                    child: Icon(
+                                      disguise
+                                          ? Icons.record_voice_over
+                                          : Icons.voice_over_off,
+                                      size: 20,
+                                      color: disguise
+                                          ? colors.accent
+                                          : colors.textTertiary,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              _HoldToTalkMic(
+                                disguise: disguise,
+                                onToggleDisguise: onToggleDisguise,
+                                onComplete: onVoiceComplete,
+                              ),
+                            ],
+                          ),
+                        )
+                      : KeyedSubtree(
+                          key: const ValueKey('send'),
+                          child: PressScale(
+                            label: l10n.commonSend,
+                            onTap: canSend ? onSend : null,
+                            scale: 0.86,
+                            haptic: false, // _send already fires its own impact
+                            child: AnimatedScale(
+                              duration: const UmbraMotion.durationNormal,
+                              curve: UmbraMotion.easeOut,
+                              scale: canSend ? 1.0 : 0.88,
+                              child: AnimatedContainer(
+                                duration: const UmbraMotion.durationNormal,
+                                curve: UmbraMotion.easeOut,
+                                width: 32,
+                                height: 32,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  color: canSend
+                                      ? colors.accent
+                                      : colors.surfaceHover,
+                                  boxShadow: canSend
+                                      ? [
+                                          BoxShadow(
+                                            color: colors.accent.withValues(
+                                              alpha: 0.35,
+                                            ),
+                                            blurRadius: 12,
+                                            spreadRadius: -1,
+                                          ),
+                                        ]
+                                      : null,
+                                ),
+                                alignment: Alignment.center,
+                                child: Icon(
+                                  Icons.arrow_upward,
+                                  size: 18,
+                                  color: canSend
+                                      ? colors.accentOn
+                                      : colors.textTertiary,
+                                ),
+                              ),
+                            ),
+                          ),
+                        );
+                  return AnimatedSwitcher(
+                    duration: const UmbraMotion.durationNormal,
+                    switchInCurve: Curves.easeOutBack,
+                    switchOutCurve: UmbraMotion.easeSharp,
+                    transitionBuilder: (child, anim) => ScaleTransition(
+                      scale: anim,
+                      child: FadeTransition(opacity: anim, child: child),
+                    ),
+                    child: end,
+                  );
+                },
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class MediaGalleryScreen extends StatelessWidget {
+  final List<String> paths;
+  // which of them the sender marked. a protected photo must stay protected
+  // wherever it is opened from, or the gallery is a second door.
+  final Set<String> securePaths;
+  final String title;
+  const MediaGalleryScreen({
+    super.key,
+    required this.paths,
+    this.securePaths = const {},
+    required this.title,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return Scaffold(
+      backgroundColor: colors.surface,
+      appBar: AppBar(
+        backgroundColor: colors.surface,
+        elevation: 0,
+        leading: IconButton(
+          tooltip: l10n.commonBack,
+          icon: const Icon(Icons.arrow_back, size: 20),
+          color: colors.textPrimary,
+          onPressed: () => Navigator.of(context).pop(),
+        ),
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              l10n.chatSharedPhotos,
+              style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 17, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.normal, height: 1.05, letterSpacing: -0.015),
+            ),
+            Text(
+              l10n.chatSharedPhotoCount(paths.length, title),
+              style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.12),
+            ),
+          ],
+        ),
+      ),
+      body: paths.isEmpty
+          ? Center(
+              child: Text(
+                l10n.chatNoPhotosInThis,
+                style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textTertiary, height: 1.5, letterSpacing: 0),
+              ),
+            )
+          : GridView.builder(
+              padding: const EdgeInsets.all(2),
+              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: 3,
+                mainAxisSpacing: 2,
+                crossAxisSpacing: 2,
+              ),
+              itemCount: paths.length,
+              itemBuilder: (context, i) {
+                final path = paths[i];
+                return GestureDetector(
+                  onTap: () => _openFullImage(
+                    context,
+                    path,
+                    secure: securePaths.contains(path),
+                  ),
+                  child: Image.file(
+                    File(path),
+                    fit: BoxFit.cover,
+                    cacheWidth: 360,
+                    filterQuality: FilterQuality.low,
+                    // a photo whose file is gone says so, not a black square
+                    errorBuilder: (_, _, _) => Container(
+                      color: colors.surfaceElevated,
+                      alignment: Alignment.center,
+                      child: Icon(
+                        Icons.image_not_supported_outlined,
+                        size: 22,
+                        color: colors.textTertiary,
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+    );
+  }
+}
+
+// the picked photo and a caption field. pops the caption on send, null on
+// back.
+class _ImageCaptionScreen extends StatefulWidget {
+  final Uint8List bytes;
+  const _ImageCaptionScreen({required this.bytes});
+  @override
+  State<_ImageCaptionScreen> createState() => _ImageCaptionScreenState();
+}
+
+class _ImageCaptionScreenState extends State<_ImageCaptionScreen> {
+  final _ctrl = TextEditingController();
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return Scaffold(
+      backgroundColor: colors.surface,
+      body: SafeArea(
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsetsDirectional.fromSTEB(4, 4, 16, 4),
+              child: Row(
+                children: [
+                  IconButton(
+                    tooltip: l10n.commonBack,
+                    icon: Icon(Icons.arrow_back, color: colors.textSecondary),
+                    onPressed: () => Navigator.of(context).pop(),
+                  ),
+                  Text(
+                    l10n.chatSendPhoto,
+                    style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 16, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+                  ),
+                ],
+              ),
+            ),
+            Expanded(
+              child: Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(14),
+                    child: Image.memory(
+                      widget.bytes,
+                      fit: BoxFit.contain,
+                      cacheWidth: screenPx(context),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _ctrl,
+                      autofocus: true,
+                      style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w400, height: 1.5, letterSpacing: 0),
+                      minLines: 1,
+                      maxLines: 4,
+                      decoration: InputDecoration(
+                        hintText: l10n.chatAddACaption,
+                        hintStyle: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w400, color: colors.textTertiary, height: 1.5, letterSpacing: 0),
+                        isDense: true,
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 10,
+                        ),
+                        filled: true,
+                        fillColor: colors.surfaceElevated,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(UmbraRadius.radius2xl),
+                          borderSide: BorderSide.none,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Semantics(
+                    label: l10n.commonSend,
+                    button: true,
+                    child: GestureDetector(
+                      onTap: () {
+                        HapticFeedback.lightImpact();
+                        Navigator.of(context).pop(_ctrl.text.trim());
+                      },
+                      child: Container(
+                        width: 44,
+                        height: 44,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: colors.accent,
+                        ),
+                        alignment: Alignment.center,
+                        child: Icon(
+                          Icons.arrow_upward,
+                          size: 20,
+                          color: colors.accentOn,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// one-shot lift + fade for a freshly-sent bubble. inactive -> returns the
+// child untouched, so old/scrolled bubbles never re-animate.
+Widget _sendOffEntrance({required bool active, required Widget child}) {
+  if (!active) return child;
+  return TweenAnimationBuilder<double>(
+    tween: Tween(begin: 0.0, end: 1.0),
+    duration: const Duration(milliseconds: 280),
+    curve: UmbraMotion.easeOut,
+    child: child,
+    builder: (_, t, c) => Opacity(
+      opacity: t,
+      child: Transform.translate(
+        offset: Offset((1 - t) * 14, (1 - t) * 30),
+        child: Transform.scale(
+          scale: 0.82 + 0.18 * t,
+          alignment: Alignment.bottomCenter,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(14),
+              boxShadow: [
+                BoxShadow(
+                  color: colors.accent.withValues(alpha: 0.45 * (1 - t)),
+                  blurRadius: 18 * (1 - t) + 2,
+                  spreadRadius: 1,
+                ),
+              ],
+            ),
+            child: c,
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+// the receiving side: a softer arrival that slides in from the left and
+// settles, distinct from the sender's amber send-off.
+Widget _arriveEntrance({required bool active, required Widget child}) {
+  if (!active) return child;
+  return TweenAnimationBuilder<double>(
+    tween: Tween(begin: 0.0, end: 1.0),
+    duration: const Duration(milliseconds: 280),
+    curve: UmbraMotion.easeOut,
+    child: child,
+    builder: (_, t, c) => Opacity(
+      opacity: t,
+      child: Transform.translate(
+        offset: Offset((1 - t) * -14, (1 - t) * 6),
+        child: Transform.scale(
+          scale: 0.96 + 0.04 * t,
+          alignment: AlignmentDirectional.centerStart,
+          child: c,
+        ),
+      ),
+    ),
+  );
+}
+
+Widget _bubbleEntrance({
+  required bool isOut,
+  required bool active,
+  required Widget child,
+}) {
+  if (!active) return child;
+  return isOut
+      ? _sendOffEntrance(active: true, child: child)
+      : _arriveEntrance(active: true, child: child);
+}
+
+// the saved mode string as the pill's enum. private is full tor, 3 hops.
+PrivacyMode _pmFrom(String m) => m == 'fast'
+    ? PrivacyMode.fast
+    : m == 'balanced'
+    ? PrivacyMode.normal
+    : PrivacyMode.private;
+
+// shown at the top of a chat when a known contact's identity key changed.
+// a reinstall looks the same as an attack, so we prompt to verify instead
+// of alarming. ok dismisses until the key changes again.
+class _KeyChangedBanner extends StatelessWidget {
+  final String peerName;
+  final VoidCallback onVerify;
+  final VoidCallback onDismiss;
+  const _KeyChangedBanner({
+    required this.peerName,
+    required this.onVerify,
+    required this.onDismiss,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+      padding: const EdgeInsets.fromLTRB(13, 11, 13, 12),
+      decoration: BoxDecoration(
+        color: colors.accent.withValues(alpha: 0.10),
+        border: Border.all(color: colors.accent.withValues(alpha: 0.45)),
+        borderRadius: BorderRadius.circular(UmbraRadius.lg),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.gpp_maybe_outlined, size: 15, color: colors.accent),
+              const SizedBox(width: 7),
+              Text(
+                l10n.chatSecurityCodeChanged,
+                style: TextStyle(
+                  color: colors.accent,
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 5),
+          Text(
+            l10n.chatMayHaveReinstalledOr(peerName),
+            style: TextStyle(
+              color: colors.textPrimary.withValues(alpha: 0.8),
+              fontSize: 12,
+              height: 1.35,
+            ),
+          ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              _ScaleTap(
+                onTap: onDismiss,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    vertical: 7,
+                    horizontal: 16,
+                  ),
+                  decoration: BoxDecoration(
+                    color: colors.surfaceElevated,
+                    borderRadius: BorderRadius.circular(9),
+                  ),
+                  child: Text(
+                    l10n.chatOk,
+                    style: TextStyle(color: colors.textPrimary, fontSize: 12.5),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _ScaleTap(
+                  onTap: onVerify,
+                  child: Container(
+                    alignment: Alignment.center,
+                    padding: const EdgeInsets.symmetric(vertical: 7),
+                    decoration: BoxDecoration(
+                      color: colors.accent,
+                      borderRadius: BorderRadius.circular(9),
+                    ),
+                    child: Text(
+                      l10n.chatVerify,
+                      style: TextStyle(
+                        color: colors.ink,
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}

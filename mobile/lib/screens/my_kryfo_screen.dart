@@ -1,0 +1,791 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// the page someone opens to bring a friend in, sorted by outcome: next to
+// you, somewhere else, or a handle. the mechanism sits under each as a
+// detail. the one screen that grows kryfo, so it gets a front door's room.
+import 'package:flutter/material.dart';
+import '../lock_state.dart';
+import 'package:flutter/services.dart';
+import 'package:qr_flutter/qr_flutter.dart';
+import 'package:share_plus/share_plus.dart';
+
+import '../contact_card.dart';
+import '../dlog.dart';
+import '../handle_lookup.dart' show handleFromInput;
+import '../main.dart'
+    show appState, buildHaloUriV3, handleHaloUri, handleHaloUriAdded;
+import '../theme/theme.dart';
+import '../widgets/halo_buttons.dart';
+import '../widgets/kryfo_avatar.dart';
+import '../widgets/motion.dart' show haloRoute;
+import '../widgets/pair_code_panel.dart';
+import 'pair_code_screen.dart';
+import '../widgets/stagger_in.dart';
+import 'handle_screen.dart';
+import 'scan_screen.dart';
+import '../l10n/l10n.dart';
+
+enum _Way { none, here, away, handle }
+
+class MyKryfoScreen extends StatefulWidget {
+  const MyKryfoScreen({super.key});
+  @override
+  State<MyKryfoScreen> createState() => _MyKryfoScreenState();
+}
+
+class _MyKryfoScreenState extends State<MyKryfoScreen> {
+  String? _uri;
+  _Way _open = _Way.none;
+
+  @override
+  void initState() {
+    super.initState();
+    appState.addListener(_onState);
+    _load();
+  }
+
+  @override
+  void dispose() {
+    appState.removeListener(_onState);
+    _handleCtrl.dispose();
+    super.dispose();
+  }
+
+  void _onState() {
+    if (_uri == null && appState.myOnion.isNotEmpty) _load();
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _load() async {
+    if (appState.myOnion.isEmpty) return;
+    final uri = await buildHaloUriV3(
+      appState.myId,
+      appState.myOnion,
+      appState.fcCounter,
+    );
+    // debug builds only: a second device on the desk can import it off
+    // logcat instead of scanning a screen
+    dlog('invite: $uri');
+    if (mounted) setState(() => _uri = uri);
+  }
+
+  void _toggle(_Way w) {
+    HapticFeedback.selectionClick();
+    setState(() => _open = _open == w ? _Way.none : w);
+  }
+
+  Future<void> _scanTheirs() async {
+    HapticFeedback.selectionClick();
+    final raw = await Navigator.of(
+      context,
+    ).push<String>(haloRoute<String>(const ScanScreen()));
+    if (raw == null || !mounted) return;
+    final status = await handleHaloUri(raw);
+    await appState.refreshContacts();
+    if (mounted) showHaloToast(context, status);
+  }
+
+  final _handleCtrl = TextEditingController();
+  bool _finding = false;
+
+  // @wren: the registry hands back the invite wren published, and it goes
+  // through the same add path as a scan
+  Future<void> _findHandle() async {
+    final typed = _handleCtrl.text.trim();
+    if (typed.isEmpty || _finding) return;
+    final raw = typed.startsWith('@') ? typed : '@$typed';
+    if (handleFromInput(raw) == null) {
+      showHaloToast(context, l10n.myKryfoAHandleIs3);
+      return;
+    }
+    HapticFeedback.selectionClick();
+    FocusScope.of(context).unfocus();
+    setState(() => _finding = true);
+    final (status, added) = await handleHaloUriAdded(raw);
+    await appState.refreshContacts();
+    if (!mounted) return;
+    setState(() => _finding = false);
+    showHaloToast(context, status);
+    if (added) {
+      HapticFeedback.mediumImpact();
+      _handleCtrl.clear();
+      final nav = Navigator.of(context);
+      if (nav.canPop()) nav.pop();
+    }
+  }
+
+  void _copyLink() {
+    if (_uri == null) return;
+    HapticFeedback.mediumImpact();
+    copySensitive(_uri!);
+    showHaloToast(context, l10n.myKryfoInviteCopiedClearsIn);
+  }
+
+  void _shareLink() {
+    if (_uri == null) return;
+    HapticFeedback.selectionClick();
+    lockState.hold(
+      () => SharePlus.instance.share(
+        ShareParams(
+          text: l10n.myKryfoAddMeOnKryfo(appState.myId, '$_uri'),
+          subject: l10n.myKryfoAddMeOnKryfo2,
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+  final colors = UmbraTheme.colorsOf(context);
+
+    final id = appState.myId;
+    final handle = appState.myHandle;
+    return Scaffold(
+      backgroundColor: colors.surface,
+      appBar: AppBar(
+        backgroundColor: colors.surface,
+        elevation: 0,
+        iconTheme: IconThemeData(color: colors.textSecondary),
+        title: Text(
+          l10n.myKryfoAddSomeone,
+          style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 18, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+        ),
+      ),
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(22, 8, 22, 40),
+          children: staggerAll([
+            // ---- identity: the part people screenshot
+            Center(
+              child: Column(
+                children: [
+                  const SizedBox(height: 10),
+                  KryfoAvatar(
+                    seed: id.isEmpty ? 'kryfo' : id,
+                    size: 96,
+                    choice: appState.myAvatar,
+                  ),
+                  const SizedBox(height: 18),
+                  Text(
+                    id.isEmpty ? '...' : id,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 22, fontWeight: FontWeight.w600, color: colors.accent, letterSpacing: 0.02),
+                  ),
+                  if (handle != null) ...[
+                    const SizedBox(height: 6),
+                    Text(
+                      ltr('@$handle'),
+                      style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+                    ),
+                  ],
+                  const SizedBox(height: 14),
+                  Text(
+                    l10n.myKryfoKryfoDoesnTScan,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 15, fontWeight: FontWeight.w400, color: colors.textSecondary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 30),
+
+            // ---- way one: next to you
+            _Way1Card(
+              open: _open == _Way.here,
+              onToggle: () => _toggle(_Way.here),
+              uri: _uri,
+              onScan: _scanTheirs,
+              onCode: () async {
+                await Navigator.of(
+                  context,
+                ).push(haloRoute(const PairCodeScreen(entering: true)));
+                if (mounted) await appState.refreshContacts();
+              },
+            ),
+            const SizedBox(height: 12),
+
+            // ---- way two: somewhere else
+            _Way2Card(
+              open: _open == _Way.away,
+              onToggle: () => _toggle(_Way.away),
+              uri: _uri,
+              onCopy: _copyLink,
+              onShare: _shareLink,
+              onCard: () async {
+                if (_uri == null) return;
+                HapticFeedback.selectionClick();
+                await shareContactCard(
+                  context: context,
+                  haloId: appState.myId,
+                  uri: _uri!,
+                );
+              },
+              onFile: () async {
+                if (_uri == null) return;
+                HapticFeedback.selectionClick();
+                await shareContactVcf(haloId: appState.myId, uri: _uri!);
+              },
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(6, 8, 6, 0),
+              child: Text(
+                l10n.myKryfoIfThisLinkEnds,
+                style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.12),
+              ),
+            ),
+            const SizedBox(height: 12),
+
+            // ---- way three: they told you a handle
+            _Way3Card(
+              open: _open == _Way.handle,
+              onToggle: () => _toggle(_Way.handle),
+              ctrl: _handleCtrl,
+              busy: _finding,
+              onFind: _findHandle,
+            ),
+            const SizedBox(height: 12),
+
+            // ---- the third way in, not hidden: a friend can vouch
+            Padding(
+              padding: const EdgeInsets.fromLTRB(6, 4, 6, 6),
+              child: Text(
+                l10n.myKryfoAlreadyShareAFriend,
+                style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 12, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.45, letterSpacing: 0),
+              ),
+            ),
+            const SizedBox(height: 12),
+
+            // ---- the handle: a public front door, if you want one
+            _HandleRow(
+              handle: handle,
+              onTap: () {
+                HapticFeedback.selectionClick();
+                Navigator.of(context).push(haloRoute(const HandleScreen()));
+              },
+              onCopy: handle == null
+                  ? null
+                  : () {
+                      HapticFeedback.selectionClick();
+                      copySensitive('@$handle');
+                      showHaloToast(context, l10n.myKryfoHandleCopied);
+                    },
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
+// ───────── the ways in ─────────
+
+// a card that opens. the head is the outcome in serif with one plain line
+// under it; the body is the mechanism, revealed with a size change and a
+// fade rather than a rebuild.
+class _WayCard extends StatelessWidget {
+  final String title;
+  final String line;
+  final IconData icon;
+  final bool open;
+  final VoidCallback onToggle;
+  final Widget body;
+  const _WayCard({
+    required this.title,
+    required this.line,
+    required this.icon,
+    required this.open,
+    required this.onToggle,
+    required this.body,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 220),
+      curve: UmbraMotion.easeOut,
+      decoration: BoxDecoration(
+        color: colors.surfaceElevated,
+        borderRadius: BorderRadius.circular(UmbraRadius.xl),
+        border: Border.all(
+          color: open
+              ? colors.accent.withValues(alpha: 0.5)
+              : colors.separator,
+          width: open ? 0.8 : 0.5,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          InkWell(
+            onTap: onToggle,
+            borderRadius: BorderRadius.circular(UmbraRadius.xl),
+            child: Padding(
+              padding: const EdgeInsetsDirectional.fromSTEB(18, 16, 14, 16),
+              child: Row(
+                children: [
+                  Icon(icon, size: 20, color: colors.accent),
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          title,
+                          style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 19, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+                        ),
+                        const SizedBox(height: 3),
+                        Text(
+                          line,
+                          style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 12.5, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.4, letterSpacing: 0),
+                        ),
+                      ],
+                    ),
+                  ),
+                  AnimatedRotation(
+                    turns: open ? 0.5 : 0,
+                    duration: const Duration(milliseconds: 220),
+                    curve: Curves.easeOutBack,
+                    child: Icon(
+                      Icons.expand_more_rounded,
+                      size: 20,
+                      color: colors.textSecondary,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          AnimatedSize(
+            duration: const Duration(milliseconds: 260),
+            curve: UmbraMotion.easeOut,
+            alignment: Alignment.topCenter,
+            child: open
+                ? AnimatedOpacity(
+                    opacity: 1,
+                    duration: const UmbraMotion.durationNormal,
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(18, 0, 18, 20),
+                      child: body,
+                    ),
+                  )
+                : const SizedBox(width: double.infinity, height: 0),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _Way1Card extends StatelessWidget {
+  final bool open;
+  final VoidCallback onToggle;
+  final String? uri;
+  final VoidCallback onScan;
+  final VoidCallback onCode;
+  const _Way1Card({
+    required this.open,
+    required this.onToggle,
+    required this.uri,
+    required this.onScan,
+    required this.onCode,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return _WayCard(
+      title: l10n.myKryfoTheyReHereWith,
+      line: l10n.myKryfoPointYourPhonesAt,
+      icon: Icons.qr_code_2_outlined,
+      open: open,
+      onToggle: onToggle,
+      body: Column(
+        children: [
+          _QrFrame(uri: uri),
+          const SizedBox(height: 16),
+          const PairCodePanel(compact: true),
+          const SizedBox(height: 14),
+          _Ghost(
+            icon: Icons.center_focus_strong_outlined,
+            label: l10n.myKryfoScanTheirsInstead,
+            onTap: onScan,
+          ),
+          const SizedBox(height: 8),
+          // a code that can be shown needs somewhere to be typed in
+          _Ghost(
+            icon: Icons.dialpad_outlined,
+            label: l10n.myKryfoTheyReadYouA,
+            onTap: onCode,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _Way2Card extends StatelessWidget {
+  final bool open;
+  final VoidCallback onToggle;
+  final String? uri;
+  final VoidCallback onCopy;
+  final VoidCallback onShare;
+  final VoidCallback onCard;
+  final VoidCallback onFile;
+  const _Way2Card({
+    required this.open,
+    required this.onToggle,
+    required this.uri,
+    required this.onCopy,
+    required this.onShare,
+    required this.onCard,
+    required this.onFile,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    final ready = uri != null;
+    return _WayCard(
+      title: l10n.myKryfoTheyReSomewhereElse,
+      line: l10n.myKryfoSendThemALink,
+      icon: Icons.send_outlined,
+      open: open,
+      onToggle: onToggle,
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          GestureDetector(
+            onTap: ready ? onCopy : null,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                color: colors.accent.withValues(alpha: 0.08),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      ready ? uri! : l10n.myKryfoYourLinkAppearsOnce,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 9.5, fontWeight: FontWeight.w500, color: ready ? colors.accent : colors.textTertiary, letterSpacing: 0.12),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Icon(Icons.copy_outlined, size: 14, color: colors.accent),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            l10n.myKryfoTheLinkCarriesYour,
+            style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 12, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.45, letterSpacing: 0),
+          ),
+          const SizedBox(height: 14),
+          HaloPrimaryButton(
+            label: l10n.myKryfoSendTheLink,
+            onTap: ready ? onShare : null,
+          ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(
+                child: _Ghost(
+                  icon: Icons.badge_outlined,
+                  label: l10n.myKryfoAsACard,
+                  sub: l10n.myKryfoAnImageWithThe,
+                  onTap: ready ? onCard : null,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _Ghost(
+                  icon: Icons.contact_page_outlined,
+                  label: l10n.myKryfoAsAFile,
+                  sub: l10n.myKryfoContactFile,
+                  onTap: ready ? onFile : null,
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// someone said "i'm @wren". one field, one button. the registry only ever
+// sees the handle asked about.
+class _Way3Card extends StatelessWidget {
+  final bool open;
+  final VoidCallback onToggle;
+  final TextEditingController ctrl;
+  final bool busy;
+  final VoidCallback onFind;
+  const _Way3Card({
+    required this.open,
+    required this.onToggle,
+    required this.ctrl,
+    required this.busy,
+    required this.onFind,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return _WayCard(
+      title: l10n.myKryfoIKnowTheirHandle,
+      line: l10n.myKryfoTypeTheNameThey,
+      icon: Icons.alternate_email,
+      open: open,
+      onToggle: onToggle,
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 2),
+            decoration: BoxDecoration(
+              color: colors.surfaceHover,
+              borderRadius: BorderRadius.circular(UmbraRadius.lg),
+              border: Border.all(color: colors.separator, width: 0.5),
+            ),
+            child: Row(
+              children: [
+                Text(
+                  '@',
+                  style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 14, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.12),
+                ),
+                const SizedBox(width: 2),
+                Expanded(
+                  child: TextField(
+                    textDirection: TextDirection.ltr,
+                    controller: ctrl,
+                    maxLength: 20,
+                    autocorrect: false,
+                    enableSuggestions: false,
+                    textInputAction: TextInputAction.search,
+                    onSubmitted: (_) => onFind(),
+                    style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 14, fontWeight: FontWeight.w500, color: colors.textPrimary, letterSpacing: 0.12),
+                    decoration: InputDecoration(
+                      border: InputBorder.none,
+                      counterText: '',
+                      hintText: l10n.myKryfoWren,
+                      hintStyle: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 14, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.12),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            l10n.myKryfoTheLookupAsksFor,
+            style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 12, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.45, letterSpacing: 0),
+          ),
+          const SizedBox(height: 14),
+          HaloPrimaryButton(
+            label: busy ? l10n.myKryfoLooking : l10n.myKryfoFindThem,
+            onTap: busy ? null : onFind,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// the qr fades up once its frame has settled, so it reads as placed, not
+// dumped
+class _QrFrame extends StatefulWidget {
+  final String? uri;
+  const _QrFrame({required this.uri});
+  @override
+  State<_QrFrame> createState() => _QrFrameState();
+}
+
+class _QrFrameState extends State<_QrFrame> {
+  bool _shown = false;
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(const Duration(milliseconds: 180), () {
+      if (mounted) setState(() => _shown = true);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    final side = MediaQuery.of(context).size.width - 22 * 2 - 18 * 2;
+    return Container(
+      width: side,
+      height: side,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: colors.textPrimary,
+        borderRadius: BorderRadius.circular(18),
+      ),
+      child: AnimatedOpacity(
+        opacity: _shown && widget.uri != null ? 1 : 0,
+        duration: const Duration(milliseconds: 260),
+        curve: UmbraMotion.easeOut,
+        child: AnimatedScale(
+          scale: _shown ? 1 : 0.94,
+          duration: const Duration(milliseconds: 280),
+          curve: Curves.easeOutBack,
+          child: widget.uri == null
+              ? Center(
+                  child: Text(
+                    l10n.myKryfoYourAddressAppearsOnce,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 12, fontWeight: FontWeight.w400, color: colors.ink, height: 1.5, letterSpacing: 0),
+                  ),
+                )
+              : QrImageView(
+                  data: widget.uri!,
+                  version: QrVersions.auto,
+                  backgroundColor: colors.textPrimary,
+                  eyeStyle: QrEyeStyle(
+                    eyeShape: QrEyeShape.square,
+                    color: colors.ink,
+                  ),
+                  dataModuleStyle: QrDataModuleStyle(
+                    dataModuleShape: QrDataModuleShape.square,
+                    color: colors.ink,
+                  ),
+                ),
+        ),
+      ),
+    );
+  }
+}
+
+class _HandleRow extends StatelessWidget {
+  final String? handle;
+  final VoidCallback onTap;
+  final VoidCallback? onCopy;
+  const _HandleRow({required this.handle, required this.onTap, this.onCopy});
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    final claimed = handle != null;
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(UmbraRadius.xl),
+      child: Container(
+        padding: const EdgeInsetsDirectional.fromSTEB(18, 16, 14, 16),
+        decoration: BoxDecoration(
+          color: colors.surfaceElevated,
+          borderRadius: BorderRadius.circular(UmbraRadius.xl),
+          border: Border.all(color: colors.separator, width: 0.5),
+        ),
+        child: Row(
+          children: [
+            Icon(Icons.alternate_email, size: 20, color: colors.accent),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    claimed ? ltr('@$handle') : l10n.myKryfoAPublicHandle,
+                    style: claimed
+                        ? TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 16, fontWeight: FontWeight.w500, color: colors.textPrimary, letterSpacing: 0.12)
+                        : TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 19, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    claimed ? l10n.myKryfoPutItInA : l10n.myKryfoANamePeopleCan,
+                    style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 12.5, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.4, letterSpacing: 0),
+                  ),
+                ],
+              ),
+            ),
+            if (onCopy != null)
+              IconButton(
+                tooltip: l10n.commonCopy,
+                onPressed: onCopy,
+                icon: Icon(
+                  Icons.copy_outlined,
+                  size: 18,
+                  color: colors.textSecondary,
+                ),
+              )
+            else
+              Icon(Icons.chevron_right, size: 20, color: colors.textSecondary),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _Ghost extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final String? sub;
+  final VoidCallback? onTap;
+  const _Ghost({
+    required this.icon,
+    required this.label,
+    this.sub,
+    required this.onTap,
+  });
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    final on = onTap != null;
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(UmbraRadius.lg),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+        decoration: BoxDecoration(
+          color: colors.surfaceHover,
+          borderRadius: BorderRadius.circular(UmbraRadius.lg),
+          border: Border.all(color: colors.separator, width: 0.5),
+        ),
+        child: Row(
+          mainAxisAlignment: sub == null
+              ? MainAxisAlignment.center
+              : MainAxisAlignment.start,
+          children: [
+            Icon(
+              icon,
+              size: 16,
+              color: on ? colors.accent : colors.textTertiary,
+            ),
+            const SizedBox(width: 9),
+            Flexible(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    label,
+                    style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w500, color: on ? colors.textPrimary : colors.textTertiary, height: 1.5, letterSpacing: 0),
+                  ),
+                  if (sub != null)
+                    Text(
+                      sub!,
+                      style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 9.5, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.12),
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}

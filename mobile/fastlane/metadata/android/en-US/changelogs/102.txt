@@ -1,0 +1,7 @@
+Fixed a way around the app lock. Update when you can.
+
+The scam shield now works in groups. A burner room message that cannot be stripped of your identity is dropped instead of sent. A refused notification permission no longer makes the app unusable on Android 13 and newer, and home says when notifications are blocked.
+
+Blocking in a group removes the person's messages for good.
+
+Release builds are made in a pinned container at F-Droid's build path, so they can be checked byte for byte.

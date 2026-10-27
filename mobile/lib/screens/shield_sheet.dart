@@ -1,0 +1,241 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// what the scam shield saw, one plain line per rule, then block, delete or
+// ignore. no score, no percentage. the person decides.
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'dart:convert';
+import '../main.dart' show db, appState;
+import '../theme/theme.dart';
+import '../widgets/notice_banner.dart';
+import '../widgets/halo_sheet.dart';
+import '../widgets/sheet_handle.dart';
+import '../l10n/l10n.dart';
+import '../scam_shield.dart';
+
+// a stored flag, as the row in the shield table reads back.
+class ShieldFlag {
+  final String headline;
+  final List<String> lines;
+  const ShieldFlag(this.headline, this.lines);
+
+  // a row with no headline is the shield saying it looked and found
+  // nothing: shown as a quiet line, never as a flag
+  static bool cleanRow(Map<String, Object?>? r) =>
+      r != null && (r['headline'] as String? ?? '').isEmpty;
+
+  static ShieldFlag? fromRow(Map<String, Object?>? r) {
+    if (r == null || (r['dismissed'] as int? ?? 0) == 1) return null;
+    if (cleanRow(r)) return null;
+    // a flag an older build stored is english sentences, shown as they are
+    try {
+      final head = r['headline'] as String;
+      final lines = [
+        for (final e in jsonDecode(r['lines'] as String) as List)
+          e is Map ? ShieldHit.fromJson(e).line : '$e',
+      ];
+      final headline = head.startsWith('{')
+          ? shieldHeadline(ShieldHit.fromJson(jsonDecode(head) as Map))
+          : head;
+      return ShieldFlag(headline, lines);
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
+enum ShieldChoice { block, delete, ignore }
+
+// returns what was chosen, after doing it. null = dismissed the sheet.
+Future<ShieldChoice?> showShieldSheet(
+  BuildContext context,
+  String haloId,
+  ShieldFlag flag, {
+  // a group member: nothing to delete, and block means everywhere
+  bool group = false,
+}) async {
+  final choice = await showHaloSheet<ShieldChoice>(
+    context,
+    builder: (_) => _ShieldSheet(flag: flag, group: group),
+  );
+  if (choice == null) return null;
+  HapticFeedback.selectionClick();
+  switch (choice) {
+    case ShieldChoice.block:
+      await appState.block(haloId);
+    case ShieldChoice.delete:
+      await db.declineRequest(haloId);
+    case ShieldChoice.ignore:
+      await db.dismissShield(haloId);
+  }
+  await appState.refreshContacts();
+  return choice;
+}
+
+class _ShieldSheet extends StatelessWidget {
+  final ShieldFlag flag;
+  final bool group;
+  const _ShieldSheet({required this.flag, this.group = false});
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+  final colors = UmbraTheme.colorsOf(context);
+
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 10, 20, 16),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const SheetHandle(),
+            const SizedBox(height: 18),
+            NoticeBanner(
+              glyph: NoticeGlyph.shield,
+              text: flag.headline,
+              color: colors.error,
+            ),
+            const SizedBox(height: 14),
+            for (var i = 0; i < flag.lines.length; i++)
+              _Line(order: i, text: flag.lines[i]),
+            const SizedBox(height: 6),
+            Text(
+              l10n.shieldCheckedOnThisPhone,
+              style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.12),
+            ),
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                _Btn(
+                  l10n.shieldBlock,
+                  colors.error,
+                  onTap: () => Navigator.pop(context, ShieldChoice.block),
+                ),
+                if (!group) ...[
+                  const SizedBox(width: 8),
+                  _Btn(
+                    l10n.shieldDelete,
+                    colors.textPrimary,
+                    onTap: () => Navigator.pop(context, ShieldChoice.delete),
+                  ),
+                ],
+                const SizedBox(width: 8),
+                Expanded(
+                  child: _Btn(
+                    l10n.shieldIgnore,
+                    colors.textPrimary,
+                    fill: true,
+                    onTap: () => Navigator.pop(context, ShieldChoice.ignore),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _Line extends StatefulWidget {
+  final int order;
+  final String text;
+  const _Line({required this.order, required this.text});
+  @override
+  State<_Line> createState() => _LineState();
+}
+
+class _LineState extends State<_Line> {
+  double _t = 0;
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(Duration(milliseconds: 80 + 40 * widget.order), () {
+      if (mounted) setState(() => _t = 1);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return AnimatedOpacity(
+      opacity: _t,
+      duration: const UmbraMotion.durationNormal,
+      child: AnimatedSlide(
+        offset: Offset((1 - _t) * 0.04, 0),
+        duration: const Duration(milliseconds: 280),
+        curve: UmbraMotion.easeOut,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 5),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Padding(
+                padding: const EdgeInsets.only(top: 7),
+                child: Container(
+                  width: 5,
+                  height: 5,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: colors.error,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  widget.text,
+                  style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w400, color: colors.textPrimary, height: 1.4, letterSpacing: 0),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _Btn extends StatefulWidget {
+  final String label;
+  final Color color;
+  final bool fill;
+  final VoidCallback onTap;
+  const _Btn(this.label, this.color, {this.fill = false, required this.onTap});
+  @override
+  State<_Btn> createState() => _BtnState();
+}
+
+class _BtnState extends State<_Btn> {
+  bool _down = false;
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return GestureDetector(
+      onTapDown: (_) => setState(() => _down = true),
+      onTapUp: (_) => setState(() => _down = false),
+      onTapCancel: () => setState(() => _down = false),
+      onTap: widget.onTap,
+      child: AnimatedScale(
+        scale: _down ? 0.96 : 1,
+        duration: const UmbraMotion.durationFast,
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 11, horizontal: 18),
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: widget.fill ? colors.surfaceHover : colors.surfaceElevated,
+            borderRadius: BorderRadius.circular(UmbraRadius.lg),
+            border: Border.all(color: colors.separator, width: 0.5),
+          ),
+          child: Text(
+            widget.label,
+            style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: widget.fill ? FontWeight.w600 : FontWeight.w400, color: widget.color, height: 1.5, letterSpacing: 0),
+          ),
+        ),
+      ),
+    );
+  }
+}

@@ -1,0 +1,259 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// the app lock and the wipe pin on one page, each with its outcome spelled
+// out
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+import '../lock_state.dart';
+import '../theme/theme.dart';
+import '../widgets/motion.dart' show haloRoute;
+import '../widgets/stagger_in.dart';
+import 'lock_setup_screen.dart';
+import 'panic_setup_screen.dart';
+import '../widgets/confirm_sheet.dart';
+import '../l10n/l10n.dart';
+
+class PinsScreen extends StatelessWidget {
+  const PinsScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+  final colors = UmbraTheme.colorsOf(context);
+
+    return Scaffold(
+      backgroundColor: colors.surface,
+      appBar: AppBar(
+        backgroundColor: colors.surface,
+        elevation: 0,
+        iconTheme: IconThemeData(color: colors.textSecondary),
+        title: Text(
+          l10n.pinsAppLock,
+          style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 18, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+        ),
+      ),
+      body: AnimatedBuilder(
+        animation: lockState,
+        builder: (context, _) {
+          final on = lockState.enabled;
+          final wipe = lockState.panicEnabled;
+          return ListView(
+            padding: const EdgeInsets.fromLTRB(20, 0, 20, 40),
+            children: staggerAll([
+              Text(
+                l10n.pinsTwoPins,
+                style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 26, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.normal, height: 1.05, letterSpacing: -0.015),
+              ),
+              const SizedBox(height: 6),
+              const SizedBox(height: 20),
+              _PinCard(
+                name: l10n.pinsYourPin,
+                state: on ? l10n.commonOn : l10n.commonOff,
+                stateColor: on ? colors.success : colors.textTertiary,
+                outcome: l10n.pinsOpensKryfoFourDigits,
+                primary: on ? l10n.pinsChangePin : l10n.pinsSetAPin,
+                onPrimary: () async {
+                  HapticFeedback.selectionClick();
+                  await Navigator.of(
+                    context,
+                  ).push(haloRoute(const LockSetupScreen()));
+                },
+                secondary: on ? l10n.pinsTurnOff : null,
+                onSecondary: on
+                    ? () async {
+                        final ok = await showConfirmSheet(
+                          context,
+                          title: l10n.pinsTurnOffTheApp,
+                          line: l10n.pinsThePinGoesAnd,
+                          yes: l10n.pinsTurnOff,
+                        );
+                        if (!ok) return;
+                        await lockState.disablePanicPin();
+                        await lockState.disable();
+                      }
+                    : null,
+                extra: on && lockState.bioSupported
+                    ? _Toggle(
+                        label: l10n.pinsUnlockWithFingerprint,
+                        on: lockState.biometric,
+                        onTap: () {
+                          HapticFeedback.selectionClick();
+                          lockState.setBiometric(!lockState.biometric);
+                        },
+                      )
+                    : null,
+              ),
+              const SizedBox(height: 12),
+              _PinCard(
+                name: l10n.pinsWipePin,
+                state: !on
+                    ? l10n.pinsNeedsAPinFirst
+                    : wipe
+                    ? l10n.pinsSet
+                    : l10n.commonOff,
+                stateColor: wipe ? colors.error : colors.textTertiary,
+                outcome: l10n.pinsTheSecondPinWipes,
+                primary: wipe ? l10n.pinsChangeWipePin : l10n.pinsSetAWipePin,
+                onPrimary: on
+                    ? () async {
+                        HapticFeedback.selectionClick();
+                        await Navigator.of(
+                          context,
+                        ).push(haloRoute(PanicSetupScreen()));
+                      }
+                    : null,
+                secondary: wipe ? l10n.pinsRemove : null,
+                onSecondary: wipe
+                    ? () async {
+                        final ok = await showConfirmSheet(
+                          context,
+                          title: l10n.pinsRemoveTheWipePin,
+                          line: l10n.pinsTheLockScreenKeeps,
+                          yes: l10n.commonRemove,
+                        );
+                        if (ok) await lockState.disablePanicPin();
+                      }
+                    : null,
+              ),
+            ]),
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _PinCard extends StatelessWidget {
+  final String name;
+  final String state;
+  final Color stateColor;
+  final String outcome;
+  final String primary;
+  final VoidCallback? onPrimary;
+  final String? secondary;
+  final VoidCallback? onSecondary;
+  final Widget? extra;
+  const _PinCard({
+    required this.name,
+    required this.state,
+    required this.stateColor,
+    required this.outcome,
+    required this.primary,
+    required this.onPrimary,
+    this.secondary,
+    this.onSecondary,
+    this.extra,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    final can = onPrimary != null;
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 16),
+      decoration: BoxDecoration(
+        color: colors.surfaceElevated,
+        borderRadius: BorderRadius.circular(UmbraRadius.xl),
+        border: Border.all(color: colors.separator),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  name,
+                  style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 20, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.normal, height: 1.05, letterSpacing: -0.015),
+                ),
+              ),
+              Text(
+                state,
+                style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w600, color: stateColor, letterSpacing: 0.1),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            outcome,
+            style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 12.5, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.45, letterSpacing: 0),
+          ),
+          if (extra != null) ...[const SizedBox(height: 12), extra!],
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              Expanded(
+                child: GestureDetector(
+                  onTap: onPrimary,
+                  behavior: HitTestBehavior.opaque,
+                  child: Container(
+                    height: 42,
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(
+                      color: can ? colors.accent : colors.surfaceHover,
+                      borderRadius: BorderRadius.circular(UmbraRadius.lg),
+                    ),
+                    child: Text(
+                      primary,
+                      style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13.5, fontWeight: FontWeight.w600, color: can ? colors.accentOn : colors.textTertiary, height: 1.5, letterSpacing: 0),
+                    ),
+                  ),
+                ),
+              ),
+              if (secondary != null) ...[
+                const SizedBox(width: 8),
+                GestureDetector(
+                  onTap: onSecondary,
+                  behavior: HitTestBehavior.opaque,
+                  child: Container(
+                    height: 42,
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(UmbraRadius.lg),
+                      border: Border.all(color: colors.separator),
+                    ),
+                    child: Text(
+                      secondary!,
+                      style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.error, height: 1.5, letterSpacing: 0),
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _Toggle extends StatelessWidget {
+  final String label;
+  final bool on;
+  final VoidCallback onTap;
+  const _Toggle({required this.label, required this.on, required this.onTap});
+  @override
+  Widget build(BuildContext context) => GestureDetector(
+    onTap: onTap,
+    behavior: HitTestBehavior.opaque,
+    child: Row(
+      children: [
+        Icon(Icons.fingerprint, size: 18, color: colors.accent),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Text(
+            label,
+            style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13.5, fontWeight: FontWeight.w400, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+          ),
+        ),
+        Text(
+          on ? l10n.commonOn : l10n.commonOff,
+          style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10.5, fontWeight: FontWeight.w600, color: on ? colors.success : colors.textTertiary, letterSpacing: 0.12),
+        ),
+      ],
+    ),
+  );
+}

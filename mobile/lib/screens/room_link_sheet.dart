@@ -1,0 +1,300 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// the way into a burner room: a qr and a link. anyone holding it can join
+// until the room ends, so the sheet says that plainly.
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:qr_flutter/qr_flutter.dart';
+import '../rooms.dart';
+import '../theme/theme.dart';
+import '../widgets/room_countdown.dart';
+import '../dlog.dart';
+import '../widgets/halo_sheet.dart';
+import '../widgets/sheet_handle.dart';
+import 'package:share_plus/share_plus.dart';
+import '../lock_state.dart';
+import '../main.dart' show appState, db;
+import '../widgets/motion.dart';
+import '../widgets/kryfo_avatar.dart';
+import 'chat_screen.dart';
+import '../l10n/l10n.dart';
+import '../l10n/marked.dart';
+
+Future<void> showRoomLinkSheet(BuildContext context, RoomLink link) {
+  return showHaloSheet<void>(
+    context,
+    scroll: true,
+    builder: (_) => _RoomLinkSheet(link: link),
+  );
+}
+
+class _RoomLinkSheet extends StatefulWidget {
+  final RoomLink link;
+  const _RoomLinkSheet({required this.link});
+  @override
+  State<_RoomLinkSheet> createState() => _RoomLinkSheetState();
+}
+
+class _RoomLinkSheetState extends State<_RoomLinkSheet>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _in;
+
+  @override
+  void initState() {
+    super.initState();
+    _in = AnimationController(
+      vsync: this,
+      duration: const UmbraMotion.durationSlow,
+    )..forward();
+    // debug builds only: lets a second device join off logcat while testing
+    dlog('room link: ${widget.link.encode()}');
+  }
+
+  @override
+  void dispose() {
+    _in.dispose();
+    super.dispose();
+  }
+
+  // to someone already in kryfo: their chat opens with the link in the box.
+  // said plainly first, since in a room nobody knows who anyone is and this
+  // is the exception.
+  Future<void> _toContact(String uri) async {
+    final contacts = appState.contacts.where((c) => !c.blocked).toList();
+    final nav = Navigator.of(context);
+    final who = await showHaloSheet<String>(
+      context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Center(child: SheetHandle()),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 16, 20, 4),
+              child: Text(
+                l10n.roomLinkSendTheRoomTo,
+                style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 19, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.normal, height: 1.05, letterSpacing: -0.015),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 0, 20, 10),
+              child: Text(
+                l10n.roomLinkTheyWillKnowThis,
+                style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 12.5, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.45, letterSpacing: 0),
+              ),
+            ),
+            if (contacts.isEmpty)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 4, 20, 22),
+                child: Text(
+                  l10n.roomLinkNoContactsYet,
+                  style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+                ),
+              )
+            else
+              for (final c in contacts)
+                InkWell(
+                  onTap: () => Navigator.pop(ctx, c.haloId),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 20,
+                      vertical: 11,
+                    ),
+                    child: Row(
+                      children: [
+                        KryfoAvatar(
+                          seed: c.avatarSeed,
+                          size: 32,
+                          choice: c.avatar,
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            c.nickname ?? c.haloId,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w500, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+    if (who == null) return;
+    final row = await db.getContact(who);
+    if (row == null) return;
+    nav.pop(); // the link sheet
+    nav.push(
+      haloRoute(
+        ChatScreen(
+          peerHaloId: who,
+          peerOnion: (row['onion'] as String?) ?? '',
+          peerXPub: (row['xpub'] as String?) ?? '',
+          avatarSeed: who,
+          avatarChoice: (row['avatar'] as num?)?.toInt(),
+          initialText: uri,
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+  final colors = UmbraTheme.colorsOf(context);
+
+    final uri = widget.link.encode();
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 10, 20, 20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const SheetHandle(),
+            const SizedBox(height: 18),
+            Text(
+              widget.link.name,
+              style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 20, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+            ),
+            const SizedBox(height: 4),
+            DateTime.now().millisecondsSinceEpoch < widget.link.expiresAt
+                ? SlotLine(
+                    msg: l10n.roomLinkEndsIn,
+                    slot: RoomCountdown(
+                      expiresAt: widget.link.expiresAt,
+                      size: 10,
+                    ),
+                    style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.12),
+                  )
+                : Row(
+                    children: [
+                      RoomCountdown(expiresAt: widget.link.expiresAt, size: 10),
+                    ],
+                  ),
+            const SizedBox(height: 18),
+            Center(
+              child: ScaleTransition(
+                scale: CurvedAnimation(parent: _in, curve: Curves.easeOutBack),
+                child: Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: colors.textPrimary,
+                    borderRadius: BorderRadius.circular(UmbraRadius.xl),
+                  ),
+                  child: QrImageView(
+                    data: uri,
+                    version: QrVersions.auto,
+                    size: 208,
+                    backgroundColor: colors.textPrimary,
+                    eyeStyle: QrEyeStyle(
+                      eyeShape: QrEyeShape.square,
+                      color: colors.ink,
+                    ),
+                    dataModuleStyle: QrDataModuleStyle(
+                      dataModuleShape: QrDataModuleShape.square,
+                      color: colors.ink,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 14),
+            Text(
+              l10n.roomLinkAnyoneWithThisCan,
+              textAlign: TextAlign.center,
+              style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 12, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+            ),
+            const SizedBox(height: 16),
+            _CopyButton(
+              onTap: () {
+                copySensitive(uri);
+                HapticFeedback.selectionClick();
+                showHaloToast(context, l10n.roomLinkRoomLinkCopied);
+              },
+            ),
+            const SizedBox(height: 4),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                _Quiet(
+                  label: l10n.roomLinkSendToAContact,
+                  onTap: () => _toContact(uri),
+                ),
+                const SizedBox(width: 18),
+                _Quiet(
+                  label: l10n.commonShare,
+                  onTap: () => lockState.hold(
+                    () => SharePlus.instance.share(ShareParams(text: uri)),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _Quiet extends StatelessWidget {
+  final String label;
+  final VoidCallback onTap;
+  const _Quiet({required this.label, required this.onTap});
+  @override
+  Widget build(BuildContext context) => GestureDetector(
+    behavior: HitTestBehavior.opaque,
+    onTap: onTap,
+    child: Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 12),
+      child: Text(
+        label,
+        style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w600, color: colors.accent, height: 1.5, letterSpacing: 0),
+      ),
+    ),
+  );
+}
+
+class _CopyButton extends StatefulWidget {
+  final VoidCallback onTap;
+  const _CopyButton({required this.onTap});
+  @override
+  State<_CopyButton> createState() => _CopyButtonState();
+}
+
+class _CopyButtonState extends State<_CopyButton> {
+  bool _down = false;
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return GestureDetector(
+      onTapDown: (_) => setState(() => _down = true),
+      onTapUp: (_) => setState(() => _down = false),
+      onTapCancel: () => setState(() => _down = false),
+      onTap: widget.onTap,
+      child: AnimatedScale(
+        scale: _down ? 0.97 : 1,
+        duration: const Duration(milliseconds: 110),
+        child: Container(
+          height: 46,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: colors.accent,
+            borderRadius: BorderRadius.circular(14),
+          ),
+          child: Text(
+            l10n.roomLinkCopyRoomLink,
+            style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w600, color: colors.ink, height: 1.5, letterSpacing: 0),
+          ),
+        ),
+      ),
+    );
+  }
+}

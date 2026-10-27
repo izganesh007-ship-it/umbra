@@ -1,0 +1,1297 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// the engine's ffi bridge for flutter: identity, the tor onion, ecdh, and
+// key export and restore.
+
+package main
+
+import "C"
+
+import (
+	"bufio"
+	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"fmt"
+	"golang.org/x/crypto/scrypt"
+	"io"
+	"log"
+	"net"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unsafe"
+
+	libtor "github.com/alexballas/go-libtor"
+	"github.com/cretz/bine/control"
+	"github.com/cretz/bine/tor"
+	"github.com/tyler-smith/go-bip39"
+	"golang.org/x/crypto/curve25519"
+)
+
+var (
+	mu           sync.Mutex
+	startMu      sync.Mutex
+	torNode      *tor.Tor
+	listener     net.Listener
+	myAddr       string
+	savedDataDir string // kept so the dialer watchdog can relaunch tor
+	inbox        []string
+
+	myEdPriv ed25519.PrivateKey
+	myEdPub  ed25519.PublicKey
+	myXPriv  [32]byte
+	myXPub   [32]byte
+	myId     string
+)
+
+var (
+	statusMu     sync.RWMutex
+	torStatus    = "off"
+	bootstrapPct = 0
+	hsdirUploads = 0
+)
+
+// debugOn gates every engine log line (see androidLogWriter). off by default
+// so release builds stay silent; dart flips it on in debug via HaloSetDebug.
+var debugOn int32
+
+//export HaloSetDebug
+func HaloSetDebug(on C.int) {
+	v := int32(0)
+	if on != 0 {
+		v = 1
+	}
+	atomic.StoreInt32(&debugOn, v)
+	mu.Lock()
+	dbg := debugTorWriter
+	mu.Unlock()
+	if dbg != nil {
+		atomic.StoreInt32(&dbg.on, v)
+	}
+}
+
+// gatedWriter feeds tor's DebugWriter. when off it discards everything so
+// tor's circuit/HSDir chatter never reaches release logcat.
+type gatedWriter struct{ on int32 }
+
+func (g *gatedWriter) Write(p []byte) (int, error) {
+	if atomic.LoadInt32(&g.on) == 0 {
+		return len(p), nil
+	}
+	return log.Writer().Write(p)
+}
+
+var debugTorWriter *gatedWriter
+
+func setStatus(s string) {
+	statusMu.Lock()
+	defer statusMu.Unlock()
+	if torStatus != s {
+		log.Printf("halo: status %s -> %s", torStatus, s)
+		if torStatus == "publishing" {
+			notePublished()
+		}
+		torStatus = s
+	}
+}
+
+//export HaloPing
+func HaloPing() *C.char {
+	return C.CString("pong from go engine")
+}
+
+//export HaloVersion
+func HaloVersion() *C.char {
+	return C.CString("halo-engine v0.1.4")
+}
+
+//export HaloGenerateIdentity
+func HaloGenerateIdentity() *C.char {
+	mu.Lock()
+	defer mu.Unlock()
+
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return C.CString(fmt.Sprintf("error: ed keygen: %v", err))
+	}
+	myEdPub = pub
+	myEdPriv = priv
+
+	if _, err := rand.Read(myXPriv[:]); err != nil {
+		return C.CString(fmt.Sprintf("error: x keygen: %v", err))
+	}
+	curve25519.ScalarBaseMult(&myXPub, &myXPriv)
+
+	myId = idFromPubkey(pub)
+	log.Printf("halo: identity generated: %s", myId)
+	return C.CString(myId)
+}
+
+// restores identity from hex-encoded ed25519 priv (64 bytes hex = 128 chars) +
+// X25519 priv (32 bytes hex = 64 chars). recomputes pubkeys + halo_id.
+//
+//export HaloRestoreIdentity
+func HaloRestoreIdentity(cEdPriv *C.char, cXPriv *C.char) *C.char {
+	mu.Lock()
+	defer mu.Unlock()
+
+	edPrivHex := C.GoString(cEdPriv)
+	xPrivHex := C.GoString(cXPriv)
+
+	edPrivBytes, err := hex.DecodeString(edPrivHex)
+	if err != nil || len(edPrivBytes) != ed25519.PrivateKeySize {
+		return C.CString("error: bad ed priv hex")
+	}
+	xPrivBytes, err := hex.DecodeString(xPrivHex)
+	if err != nil || len(xPrivBytes) != 32 {
+		return C.CString("error: bad x priv hex")
+	}
+
+	myEdPriv = ed25519.PrivateKey(edPrivBytes)
+	myEdPub = myEdPriv.Public().(ed25519.PublicKey)
+
+	copy(myXPriv[:], xPrivBytes)
+	curve25519.ScalarBaseMult(&myXPub, &myXPriv)
+
+	myId = idFromPubkey(myEdPub)
+	log.Printf("halo: identity restored: %s", myId)
+	return C.CString(myId)
+}
+
+//export HaloMyId
+func HaloMyId() *C.char {
+	mu.Lock()
+	defer mu.Unlock()
+	return C.CString(myId)
+}
+
+//export HaloMyEdPubkey
+func HaloMyEdPubkey() *C.char {
+	mu.Lock()
+	defer mu.Unlock()
+	if myEdPub == nil {
+		return C.CString("")
+	}
+	return C.CString(hex.EncodeToString(myEdPub))
+}
+
+//export HaloMyXPubkey
+func HaloMyXPubkey() *C.char {
+	mu.Lock()
+	defer mu.Unlock()
+	return C.CString(hex.EncodeToString(myXPub[:]))
+}
+
+// exports private keys so the dart side can persist them encrypted.
+// only call this once after generation; never log or transmit.
+//
+//export HaloMyEdPrivkey
+func HaloMyEdPrivkey() *C.char {
+	mu.Lock()
+	defer mu.Unlock()
+	if myEdPriv == nil {
+		return C.CString("")
+	}
+	return C.CString(hex.EncodeToString(myEdPriv))
+}
+
+//export HaloMyXPrivkey
+func HaloMyXPrivkey() *C.char {
+	mu.Lock()
+	defer mu.Unlock()
+	return C.CString(hex.EncodeToString(myXPriv[:]))
+}
+
+//export HaloIdFromPubkey
+func HaloIdFromPubkey(cHex *C.char) *C.char {
+	pubHex := C.GoString(cHex)
+	pub, err := hex.DecodeString(pubHex)
+	if err != nil {
+		return C.CString(fmt.Sprintf("error: bad hex: %v", err))
+	}
+	return C.CString(idFromPubkey(pub))
+}
+
+func idFromPubkey(pub []byte) string {
+	h := sha256.Sum256(pub)
+	wordlist := bip39.GetWordList()
+	bits := uint64(h[0])<<32 | uint64(h[1])<<24 | uint64(h[2])<<16 | uint64(h[3])<<8 | uint64(h[4])
+	w1 := wordlist[(bits>>22)&0x7FF]
+	w2 := wordlist[(bits>>11)&0x7FF]
+	w3 := wordlist[bits&0x7FF]
+	return fmt.Sprintf("%s-%s-%s", w1, w2, w3)
+}
+
+func deriveSharedKey(peerXPubHex string) ([32]byte, error) {
+	var key [32]byte
+	peerPub, err := hex.DecodeString(peerXPubHex)
+	if err != nil || len(peerPub) != 32 {
+		return key, fmt.Errorf("bad peer pubkey")
+	}
+	var peer [32]byte
+	copy(peer[:], peerPub)
+
+	shared, err := curve25519.X25519(myXPriv[:], peer[:])
+	if err != nil {
+		return key, err
+	}
+	key = sha256.Sum256(shared)
+	return key, nil
+}
+
+//export HaloEncryptFor
+func HaloEncryptFor(cPeerPub *C.char, cPlain *C.char) *C.char {
+	peerPub := C.GoString(cPeerPub)
+	plain := C.GoString(cPlain)
+
+	key, err := deriveSharedKey(peerPub)
+	if err != nil {
+		return C.CString(fmt.Sprintf("error: derive: %v", err))
+	}
+
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return C.CString(fmt.Sprintf("error: cipher: %v", err))
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return C.CString(fmt.Sprintf("error: gcm: %v", err))
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return C.CString(fmt.Sprintf("error: nonce: %v", err))
+	}
+	ct := gcm.Seal(nil, nonce, []byte(plain), nil)
+	out := append(nonce, ct...)
+	return C.CString(base64.StdEncoding.EncodeToString(out))
+}
+
+//export HaloDecryptFrom
+func HaloDecryptFrom(cPeerPub *C.char, cB64 *C.char) *C.char {
+	peerPub := C.GoString(cPeerPub)
+	b64 := C.GoString(cB64)
+
+	key, err := deriveSharedKey(peerPub)
+	if err != nil {
+		return C.CString(fmt.Sprintf("error: derive: %v", err))
+	}
+
+	raw, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return C.CString(fmt.Sprintf("error: b64: %v", err))
+	}
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return C.CString(fmt.Sprintf("error: cipher: %v", err))
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return C.CString(fmt.Sprintf("error: gcm: %v", err))
+	}
+	nsize := gcm.NonceSize()
+	if len(raw) < nsize {
+		return C.CString("error: ciphertext too short")
+	}
+	nonce, ct := raw[:nsize], raw[nsize:]
+	plain, err := gcm.Open(nil, nonce, ct, nil)
+	if err != nil {
+		return C.CString(fmt.Sprintf("error: open: %v", err))
+	}
+	return C.CString(string(plain))
+}
+
+//export HaloStartListener
+func HaloStartListener(cDataDir *C.char) *C.char {
+	return C.CString(startListener(C.GoString(cDataDir)))
+}
+
+// the onion address, or a line starting with "error:". plain go so the
+// tor tests can drive it; cgo cannot be called from a _test.go file.
+func startListener(dataDir string) string {
+	// startMu serializes start against shutdown. mu is only taken around
+	// the shared vars so other ffi calls don't freeze for the seconds tor
+	// takes to come up.
+	startMu.Lock()
+	defer startMu.Unlock()
+
+	if torIsPaused() {
+		return "error: tor is stopped, resume first"
+	}
+	startRouteWatch()
+	mu.Lock()
+	if myAddr != "" {
+		addr := myAddr
+		mu.Unlock()
+		return addr
+	}
+	mu.Unlock()
+
+	if dataDir == "" {
+		return "error: empty data dir"
+	}
+	torDataDir := dataDir + "/tor"
+	if err := os.MkdirAll(torDataDir, 0700); err != nil {
+		return fmt.Sprintf("error: mkdir tor: %v", err)
+	}
+	mu.Lock()
+	savedDataDir = dataDir
+	mu.Unlock()
+
+	// a hard-killed previous process can leave tor's lock and run files
+	// behind, which fail this start. tor is single-instance per data dir and
+	// we hold startMu, so removing them here is safe.
+	cleanTorRunFiles(torDataDir)
+
+	setStatus("starting")
+	log.Println("halo: starting embedded tor...")
+	choosePinnedSocks()
+	start := func() (*tor.Tor, error) {
+		return tor.Start(nil, &tor.StartConf{
+			ProcessCreator: libtor.Creator,
+			DataDir:        torDataDir,
+			DebugWriter:    newTorDebugWriter(),
+			ExtraArgs:      torArgs(),
+			// torArgs names the port itself when the pin holds; bine would
+			// otherwise add "--SocksPort auto" alongside it.
+			NoAutoSocksPort: socksPin() != 0,
+		})
+	}
+	t, err := start()
+	if err != nil && socksPin() != 0 {
+		// something else took the port between choosing it and tor binding
+		// it. not worth failing a start over: let tor choose, and the cache
+		// resets keep one-shot requests working across a bounce.
+		dropSocksPin(err.Error())
+		t, err = start()
+	}
+	if err != nil {
+		return fmt.Sprintf("error: tor start: %v", err)
+	}
+	mu.Lock()
+	torNode = t
+	mu.Unlock()
+	// whatever control socket we held belonged to the tor before this one,
+	// and so did the socks port any cached http client was built against.
+	ctrlReset()
+	eventReset()
+	nostrResetClient()
+	// stay "starting": tor.Start returns before any circuit exists. the
+	// bootstrap watcher owns the flip at a real 100%.
+	goWatchBootstrap(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	keyPath := dataDir + "/onion.key"
+	var key ed25519.PrivateKey
+	if data, rerr := os.ReadFile(keyPath); rerr == nil && len(data) == ed25519.PrivateKeySize {
+		key = ed25519.PrivateKey(data)
+		log.Println("halo: loaded onion key from disk")
+	} else {
+		_, key, err = ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			return fmt.Sprintf("error: gen onion key: %v", err)
+		}
+		if werr := os.WriteFile(keyPath, key, 0600); werr != nil {
+			log.Printf("halo: WARN onion key save failed: %v", werr)
+		} else {
+			log.Println("halo: generated and saved new onion key")
+		}
+	}
+
+	// no status flip here: publishing means nothing while bootstrap is at
+	// 50%. the watcher sets it when tor is actually there.
+	hsCh, hsSubbed := listenForUploads(t)
+	// tor starts with the network off. bine turns it on inside Listen, but
+	// only on the branch NoWait skips, so turn it on here, over the engine's
+	// own connection (see control_events.go).
+	if eerr := ctrlDo(t, "DisableNetwork 0", func(c *control.Conn) error {
+		return c.SetConf(control.KeyVals("DisableNetwork", "0")...)
+	}); eerr != nil {
+		log.Printf("halo: enable network: %v", eerr)
+	}
+
+	listenStart := time.Now()
+	onion, err := t.Listen(ctx, &tor.ListenConf{
+		NoWait:      true,
+		Version3:    true,
+		RemotePorts: []int{80},
+		Key:         key,
+	})
+	if err != nil {
+		log.Printf("halo: listen failed after %.0fs: %v", time.Since(listenStart).Seconds(), err)
+		return fmt.Sprintf("error: listen: %v", err)
+	}
+	log.Printf("halo: listen returned in %.0fs", time.Since(listenStart).Seconds())
+	mu.Lock()
+	listener = onion
+	myAddr = fmt.Sprintf("%s.onion", onion.ID)
+	addr := myAddr
+	mu.Unlock()
+
+	if atomic.CompareAndSwapInt32(&publishWatching, 0, 1) {
+		go func() {
+			defer atomic.StoreInt32(&publishWatching, 0)
+			watchPublishedOn(t, hsCh, hsSubbed, onion.ID)
+		}()
+	}
+
+	go acceptLoop(onion)
+
+	log.Printf("halo: listening on %s", addr)
+	return addr
+}
+
+// bine writes a fresh torrc and control-port file per run and does not always
+// clean them up. a half-written one left by a dying process is read by the
+// next start as "invalid port format" and fails it.
+func cleanTorRunFiles(dir string) {
+	os.Remove(dir + "/lock")
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		n := e.Name()
+		if strings.HasPrefix(n, "control-port-") || strings.HasPrefix(n, "torrc-") {
+			os.Remove(dir + "/" + n)
+		}
+	}
+}
+
+// tor 0.4.9.5, as go-libtor vendors it, survives exactly one shutdown per
+// process. the second tor.Close() either hangs inside the control connection
+// or aborts the whole app:
+//
+//	INTERNAL ERROR: Raw assertion failed in Tor 0.4.9.5 at
+//	compat_mutex_pthreads.c:120: Error destroying a mutex.  SIGABRT
+//
+// so nothing here closes tor, ever. a wedged dialer, a bridge change or a hop
+// back onto onion hands tor the config it needs and bounces DisableNetwork,
+// which closes every circuit and connection, as tor browser and orbot do to
+// apply a bridge change. the consensus and the guards stay, so coming back
+// takes a quarter of a second instead of a bootstrap.
+//
+// serialized on startMu against a start so the two cannot overlap.
+var torRestarting int32
+
+var lastTorRestart int64 // unix seconds of the last one, for the cooldown
+
+// one watcher of each kind at a time. each parks on a control event listener,
+// and one left behind per reconnect is a leak.
+var (
+	bootstrapWatching int32
+	publishWatching   int32
+)
+
+func goWatchBootstrap(t *tor.Tor) {
+	if !atomic.CompareAndSwapInt32(&bootstrapWatching, 0, 1) {
+		return
+	}
+	go func() {
+		defer atomic.StoreInt32(&bootstrapWatching, 0)
+		watchBootstrap(t)
+	}()
+}
+
+func goWatchPublished(t *tor.Tor, onionID string) {
+	if t == nil || t.Control == nil || onionID == "" {
+		return
+	}
+	if !atomic.CompareAndSwapInt32(&publishWatching, 0, 1) {
+		return
+	}
+	go func() {
+		defer atomic.StoreInt32(&publishWatching, 0)
+		hsCh, hsSubbed := listenForUploads(t)
+		watchPublishedOn(t, hsCh, hsSubbed, onionID)
+	}()
+}
+
+// subscribe before the thing that would fire: at a start the first UPLOADED
+// can arrive while Listen is still setting the onion up, and missing it means
+// sitting out the full fallback.
+func listenForUploads(t *tor.Tor) (chan control.Event, bool) {
+	hsCh := make(chan control.Event, 16)
+	if t == nil || t.Control == nil {
+		return hsCh, false
+	}
+	// on the event connection, never on bine's: see control_events.go
+	c, err := eventConn(t)
+	if err != nil {
+		log.Printf("halo: HSDesc subscribe failed: %v", err)
+		return hsCh, false
+	}
+	if aerr := c.AddEventListener(hsCh, control.EventCodeHSDesc); aerr != nil {
+		log.Printf("halo: HSDesc subscribe failed: %v", aerr)
+		return hsCh, false
+	}
+	return hsCh, true
+}
+
+func watchPublishedOn(t *tor.Tor, hsCh chan control.Event, hsSubbed bool, onionID string) {
+	if hsSubbed {
+		defer func() {
+			evMu.Lock()
+			c := evConn
+			evMu.Unlock()
+			if c != nil {
+				c.RemoveEventListener(hsCh, control.EventCodeHSDesc)
+			}
+		}()
+	}
+	for {
+		if watchHSDirUpload(t, hsCh, hsSubbed, onionID) {
+			break
+		}
+		statusMu.RLock()
+		stillPub := torStatus == "publishing" || torStatus == "starting"
+		statusMu.RUnlock()
+		if !stillPub {
+			return
+		}
+		// no confirmed upload yet: the same listener stays live, so wait for
+		// a late descriptor instead of claiming reachable.
+	}
+	statusMu.Lock()
+	if torStatus == "publishing" {
+		log.Println("halo: status publishing -> reachable (HSDir uploaded)")
+		torStatus = "reachable"
+		notePublished()
+		go func() {
+			if _, err := torNostrClient(); err != nil {
+				log.Printf("halo: nostr client pre-warm failed: %v", err)
+			} else {
+				log.Println("halo: nostr client pre-warmed")
+			}
+		}()
+	}
+	statusMu.Unlock()
+}
+
+// hands tor the bridge configuration it should be using right now. all three
+// are set every time bridges are turned on, ClientTransportPlugin included
+// even when unchanged: turning bridges off drops tor's registration of the
+// transport, and without it tor has bridge lines and no way to reach them.
+func applyBridgeConf(t *tor.Tor) error {
+	if t == nil || t.Control == nil {
+		return fmt.Errorf("no control connection")
+	}
+	if !bridgesEnabled() {
+		noteStep("setconf bridges off")
+		if err := ctrlDo(t, "UseBridges 0", func(c *control.Conn) error {
+			return c.SetConf(control.KeyVals("UseBridges", "0")...)
+		}); err != nil {
+			return err
+		}
+		// the lines go too, or a later UseBridges 1 would quietly use the
+		// list from last time
+		return ctrlDo(t, "RESETCONF Bridge", func(c *control.Conn) error {
+			return c.ResetConf(&control.KeyVal{Key: "Bridge"})
+		})
+	}
+	noteStep("pt listener")
+	if err := startPTListener(); err != nil {
+		return err
+	}
+	bridgeMu.RLock()
+	port := ptPort
+	bridgeMu.RUnlock()
+	if port == 0 {
+		return fmt.Errorf("no pt listener")
+	}
+	kv := []*control.KeyVal{
+		control.NewKeyVal("ClientTransportPlugin",
+			fmt.Sprintf("obfs4 socks5 127.0.0.1:%d", port)),
+		control.NewKeyVal("UseBridges", "1"),
+	}
+	lines := bridgeLines()
+	for _, b := range lines {
+		kv = append(kv, control.NewKeyVal("Bridge", b))
+	}
+	log.Printf("bridges: handing tor %d bridge lines via 127.0.0.1:%d", len(lines), port)
+	noteStep("setconf plugin+bridges")
+	return ctrlDo(t, "ClientTransportPlugin+Bridge", func(c *control.Conn) error {
+		return c.SetConf(kv...)
+	})
+}
+
+// where the last reconnect got to, and how it ended. a bounce that stalls
+// does so inside tor's control port, which says nothing in a release build,
+// so it is written down here and shown on the transport screen.
+// two slots: the step says where a reconnect is right now, the outcome how
+// the last one ended. an outcome is never built from an outcome, or each
+// timeout nests inside the one before it.
+var (
+	reconnectStep    atomic.Value // string, where a running reconnect is
+	reconnectOutcome atomic.Value // string, how the last one ended
+	reconnectRunning int32
+	// when the running one began, unix nanos, 0 when none is
+	reconnectSince int64
+)
+
+func noteStep(s string) { reconnectStep.Store(s) }
+
+func noteOutcome(s string) { reconnectOutcome.Store(s) }
+
+func lastReconnectStep() string {
+	if v, ok := reconnectStep.Load().(string); ok {
+		return v
+	}
+	return ""
+}
+
+func lastReconnectOutcome() string {
+	if atomic.LoadInt32(&reconnectRunning) == 1 {
+		if st := lastReconnectStep(); st != "" {
+			return "running, at " + st
+		}
+		return "running"
+	}
+	if v, ok := reconnectOutcome.Load().(string); ok {
+		return v
+	}
+	return ""
+}
+
+//export HaloLastReconnect
+func HaloLastReconnect() *C.char { return C.CString(lastReconnectOutcome()) }
+
+// the bounce itself. "ok", or a line starting with "error:".
+func reconnectTor() string {
+	// asleep on purpose: the check-in mode takes tor off the network between
+	// checks, and every watchdog that finds it quiet comes through here. none
+	// of them may bring it back: that is the app's call, not a watchdog's.
+	if torIsPaused() {
+		log.Println("halo: reconnect skipped - tor is asleep on purpose")
+		return "error: tor is asleep"
+	}
+	if !atomic.CompareAndSwapInt32(&torRestarting, 0, 1) {
+		// one that has run for five minutes is stuck, and "one already
+		// running" for ever leaves the offline card's button dead. take the
+		// flag over; the stuck one clears it again if it ever returns, which
+		// is harmless.
+		since := atomic.LoadInt64(&reconnectSince)
+		if since == 0 || time.Since(time.Unix(0, since)) < 5*time.Minute {
+			return "error: one already running"
+		}
+		log.Printf("halo: a reconnect has sat at %q for %s - abandoning it",
+			lastReconnectStep(), time.Since(time.Unix(0, since)).Round(time.Second))
+		noteOutcome("abandoned at " + lastReconnectStep())
+	}
+	defer atomic.StoreInt32(&torRestarting, 0)
+
+	// a quiet-but-alive relay should not drive a loop. a bounce is cheap, so
+	// the floor is a minute.
+	now := time.Now().Unix()
+	if prev := atomic.LoadInt64(&lastTorRestart); prev != 0 && now-prev < 60 {
+		log.Printf("halo: reconnect skipped - %ds since the last (floor 60s)", now-prev)
+		return "error: too soon"
+	}
+	atomic.StoreInt64(&lastTorRestart, now)
+
+	mu.Lock()
+	t := torNode
+	dir := savedDataDir
+	addr := myAddr
+	mu.Unlock()
+
+	if dir == "" {
+		log.Println("halo: reconnect skipped - no saved data dir")
+		setStatus("off")
+		return "error: no data dir"
+	}
+	// no tor in this process yet, or one that never got a control port: this
+	// is a first start, and a first start is the one that is safe. it takes
+	// startMu itself.
+	if t == nil || t.Control == nil {
+		out := startListener(dir)
+		if strings.HasPrefix(out, "error:") {
+			return out
+		}
+		return "ok"
+	}
+
+	// every control command inside reconnectOn carries its own deadline, so
+	// this returns whatever tor does; a wedged control port comes back as an
+	// error rather than as a lock nobody will ever release.
+	started := time.Now()
+	atomic.StoreInt64(&reconnectSince, started.UnixNano())
+	atomic.StoreInt32(&reconnectRunning, 1)
+	r := reconnectOn(t, addr)
+	atomic.StoreInt32(&reconnectRunning, 0)
+	atomic.StoreInt64(&reconnectSince, 0)
+	noteOutcome(fmt.Sprintf("%s after %s", r, time.Since(started).Round(time.Millisecond)))
+	return r
+}
+
+// the control work. it does not take startMu: a lock held across a control
+// command that never answers blocks every later start. it serializes against
+// itself through the torRestarting flag its caller holds, and against other
+// control users through ctrlDo's own bounded lock.
+func reconnectOn(t *tor.Tor, addr string) string {
+	log.Println("halo: reconnecting tor (config change or wedged dialer)")
+	noteStep("start")
+	atomic.StoreInt32(&bounceOff, 1)
+	routeBump()
+	statusMu.Lock()
+	hsdirUploads = 0
+	bootstrapPct = 0
+	statusMu.Unlock()
+	setStatus("starting")
+	// dropped in the background: torNostrClient holds that same mutex for up
+	// to half a minute while it builds a dialer, with relay runners queued
+	// behind it. nothing is lost by being late; this only shakes off a dialer
+	// that wedged.
+	go nostrResetClient()
+
+	// the network goes down first, and the config changes while it is down.
+	// changing bridges under a live tor that is part way through a handshake
+	// with an unreachable one makes it stop answering its control port
+	// altogether: SETCONF never returns and everything queued behind it waits
+	// for ever. this is the order tor browser uses for the same change.
+	noteStep("network off")
+	if err := ctrlDo(t, "DisableNetwork 1", func(c *control.Conn) error {
+		return c.SetConf(control.KeyVals("DisableNetwork", "1")...)
+	}); err != nil {
+		log.Printf("halo: tor would not leave the network: %v", err)
+		atomic.StoreInt32(&bounceOff, 0)
+		setStatus("off")
+		return "error: " + err.Error()
+	}
+	// let it drop what it had before it is told anything else
+	time.Sleep(500 * time.Millisecond)
+	noteStep("bridge config")
+	if err := applyBridgeConf(t); err != nil {
+		log.Printf("halo: bridge config not applied: %v", err)
+	}
+	noteStep("network on")
+	if err := ctrlDo(t, "DisableNetwork 0", func(c *control.Conn) error {
+		return c.SetConf(control.KeyVals("DisableNetwork", "0")...)
+	}); err != nil {
+		log.Printf("halo: tor would not come back: %v", err)
+		atomic.StoreInt32(&bounceOff, 0)
+		setStatus("off")
+		return "error: " + err.Error()
+	}
+	// the new route starts here. anything that connects from now on went
+	// through the tor that came back, so it may vouch for it.
+	routeBump()
+	atomic.StoreInt32(&bounceOff, 0)
+	// and again now the network is back, which is the one that matters.
+	// tor reopens its socks listener on the way back, and anything rebuilt
+	// during the bounce (relay runners loop through torNostrClient()
+	// throughout) holds a client bound to the old port. the relays heal
+	// through relaysAllDead(), a one-shot request does not.
+	nostrResetClient()
+	relayClearBenches()
+	kickRelays()
+	noteStep("watchers")
+	goWatchBootstrap(t)
+	goWatchPublished(t, strings.TrimSuffix(addr, ".onion"))
+	log.Println("halo: tor reconnected")
+	return "ok"
+}
+
+// set while tor is quiet because the app asked for it to be: the check-in
+// mode runs tor for a minute at a time and wants it silent in between.
+var torPaused int32
+
+func torIsPaused() bool { return atomic.LoadInt32(&torPaused) == 1 }
+
+// puts tor to sleep and keeps it there. it does not shut tor down: tor
+// survives one shutdown per process, and a day of check-ins is ninety-six of
+// them. DisableNetwork=1 closes every connection and circuit instead, and
+// waking is the same setting turned back, quick with the consensus it kept.
+//
+// "ok" when tor went quiet or was not running, "error: ..." when it would
+// not take the setting. on an error tor is left exactly as it was.
+//
+//export HaloTorStop
+func HaloTorStop() *C.char { return C.CString(torStop()) }
+
+func torStop() string {
+	atomic.StoreInt32(&torPaused, 1)
+	mu.Lock()
+	t := torNode
+	mu.Unlock()
+	// in the background, as in reconnectOn: this takes cachedNostrClientMu,
+	// which a dialer being built holds for up to half a minute.
+	go nostrResetClient()
+	if t == nil || t.Control == nil {
+		setStatus("off")
+		return "ok"
+	}
+	if err := ctrlDo(t, "DisableNetwork 1", func(c *control.Conn) error {
+		return c.SetConf(control.KeyVals("DisableNetwork", "1")...)
+	}); err != nil {
+		log.Printf("halo: tor would not leave the network: %v", err)
+		atomic.StoreInt32(&torPaused, 0)
+		return "error: " + err.Error()
+	}
+	statusMu.Lock()
+	hsdirUploads = 0
+	bootstrapPct = 0
+	statusMu.Unlock()
+	setStatus("off")
+	log.Println("halo: tor is off the network")
+	return "ok"
+}
+
+// lets tor run again, and wakes it if it is only asleep. "ok" means awake
+// or waking, "start" means there is no tor in this process yet and
+// HaloStartListener has to make one.
+//
+//export HaloTorResume
+func HaloTorResume() *C.char { return C.CString(torResume()) }
+
+func torResume() string {
+	atomic.StoreInt32(&torPaused, 0)
+	mu.Lock()
+	t := torNode
+	addr := myAddr
+	mu.Unlock()
+	if t == nil || t.Control == nil {
+		return "start"
+	}
+	if err := ctrlDo(t, "DisableNetwork 0", func(c *control.Conn) error {
+		return c.SetConf(control.KeyVals("DisableNetwork", "0")...)
+	}); err != nil {
+		log.Printf("halo: tor would not come back: %v", err)
+		return "error: " + err.Error()
+	}
+	statusMu.Lock()
+	hsdirUploads = 0
+	statusMu.Unlock()
+	// the socks port the sleeping tor had is not the one it has now, so the
+	// cached client goes
+	nostrResetClient()
+	setStatus("starting")
+	goWatchBootstrap(t)
+	if id := strings.TrimSuffix(addr, ".onion"); id != "" {
+		goWatchPublished(t, id)
+	}
+	// every relay runner that found tor asleep is parked in a fifteen-minute
+	// sleep that only a kick ends, so the wake kicks, whoever asked for it.
+	relayClearBenches()
+	kickRelays()
+	log.Println("halo: tor is back on the network")
+	return "ok"
+}
+
+//export HaloTorPaused
+func HaloTorPaused() C.int {
+	if torIsPaused() {
+		return 1
+	}
+	return 0
+}
+
+func newTorDebugWriter() *gatedWriter {
+	mu.Lock()
+	defer mu.Unlock()
+	debugTorWriter = &gatedWriter{on: atomic.LoadInt32(&debugOn)}
+	return debugTorWriter
+}
+
+func acceptLoop(l net.Listener) {
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			log.Printf("halo: accept err: %v", err)
+			return
+		}
+		log.Printf("halo: incoming connection from %s", conn.RemoteAddr())
+		go handleConn(conn)
+	}
+}
+
+func handleConn(conn net.Conn) {
+	defer conn.Close()
+	// so many doors at once, no more. the ninth is shut unread.
+	select {
+	case inboxSlots <- struct{}{}:
+	default:
+		log.Printf("halo: door full, dropped a connection")
+		return
+	}
+	defer func() { <-inboxSlots }()
+	// a line is one write: ten seconds is generous over tor. the reader
+	// stops just past the largest line the door accepts.
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	r := bufio.NewReader(io.LimitReader(conn, inboxMaxLine+2))
+	line, err := r.ReadString('\n')
+	if err != nil && err != io.EOF {
+		log.Printf("halo: read err: %v", err)
+		return
+	}
+	line = strings.TrimSpace(line)
+	// junk never reaches dart's trial decrypts, and a full or repeated
+	// inbox takes nothing more. no ack either way: an honest sender
+	// retries through its backoff, a flood learns nothing.
+	if !inboxShapeOK(line) {
+		log.Printf("halo: dropped %d bytes that are not a message", len(line))
+		return
+	}
+	if !inboxPut(line) {
+		log.Printf("halo: inbox full or repeat, dropped %d bytes", len(line))
+		return
+	}
+	conn.Write([]byte("ack\n"))
+	log.Printf("halo: received %d bytes", len(line))
+}
+
+//export HaloGetStatus
+func HaloGetStatus() *C.char {
+	ok, gen := 0, routeGeneration()
+	if routeOK() {
+		ok = 1
+	}
+	statusMu.RLock()
+	defer statusMu.RUnlock()
+	// status|bootstrap|hsdir uploads|route carries traffic|route generation
+	return C.CString(fmt.Sprintf("%s|%d|%d|%d|%d", torStatus, bootstrapPct, hsdirUploads, ok, gen))
+}
+
+//export HaloDrainInbox
+func HaloDrainInbox() *C.char {
+	mu.Lock()
+	defer mu.Unlock()
+	if len(inbox) == 0 {
+		return C.CString("")
+	}
+	out := strings.Join(inbox, "\n")
+	inboxDrained()
+	return C.CString(out)
+}
+
+//export HaloSendTo
+func HaloSendTo(cAddr *C.char, cMsg *C.char) *C.char {
+	addr := C.GoString(cAddr)
+	msg := C.GoString(cMsg)
+
+	mu.Lock()
+	t := torNode
+	mu.Unlock()
+	if t == nil {
+		return C.CString("error: tor not started")
+	}
+
+	log.Printf("halo: dialing %s...", addr)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	dialer, err := torDialer(ctx, t)
+	if err != nil {
+		return C.CString(fmt.Sprintf("error: dialer: %v", err))
+	}
+
+	conn, err := dialer.DialContext(ctx, "tcp", addr+":80")
+	if err != nil {
+		return C.CString(fmt.Sprintf("error: dial: %v", err))
+	}
+	defer conn.Close()
+
+	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	_, err = conn.Write([]byte(msg + "\n"))
+	if err != nil {
+		return C.CString(fmt.Sprintf("error: write: %v", err))
+	}
+
+	conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+	if _, err := bufio.NewReader(conn).ReadString('\n'); err != nil {
+		return C.CString(fmt.Sprintf("error: no ack: %v", err))
+	}
+
+	log.Printf("halo: sent %d bytes to %s", len(msg), addr)
+	return C.CString("ok")
+}
+
+func main() {}
+
+// derives the 3-word BIP-39 halo id from an ed25519 public key hex string.
+// used during back-pair when a stranger's first message arrives and we need
+// to compute their halo id from the identity key in the libsignal envelope.
+//
+//export HaloIdFromEdPub
+func HaloIdFromEdPub(cHexPub *C.char) *C.char {
+	hexPub := C.GoString(cHexPub)
+	pub, err := hex.DecodeString(hexPub)
+	if err != nil || len(pub) != 32 {
+		return C.CString("")
+	}
+	return C.CString(idFromPubkey(pub))
+}
+
+// encrypts a UTF-8 plaintext payload (typically a JSON blob containing
+// the user's identity keys + db + prefs) with a passphrase using scrypt
+// (32768 / 8 / 1) + AES-256-GCM. returns "halo-backup:v1:" + base64
+// (salt || nonce || ciphertext+tag). returns "error: ..." on failure.
+//
+//export HaloEncryptBackup
+func HaloEncryptBackup(cPlain, cPassphrase *C.char) *C.char {
+	plain := []byte(C.GoString(cPlain))
+	passphrase := C.GoString(cPassphrase)
+
+	salt := make([]byte, 16)
+	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
+		return C.CString("error: rand: " + err.Error())
+	}
+	key, err := scrypt.Key([]byte(passphrase), salt, 32768, 8, 1, 32)
+	if err != nil {
+		return C.CString("error: scrypt: " + err.Error())
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return C.CString("error: aes: " + err.Error())
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return C.CString("error: gcm: " + err.Error())
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return C.CString("error: nonce: " + err.Error())
+	}
+	ct := gcm.Seal(nil, nonce, plain, nil)
+	blob := append(append(salt, nonce...), ct...)
+	return C.CString("halo-backup:v1:" + base64.StdEncoding.EncodeToString(blob))
+}
+
+// inverse of HaloEncryptBackup. returns plaintext on success or
+// "error: wrong passphrase or corrupt" on auth failure.
+//
+//export HaloDecryptBackup
+func HaloDecryptBackup(cBlob, cPassphrase *C.char) *C.char {
+	blob := C.GoString(cBlob)
+	passphrase := C.GoString(cPassphrase)
+	prefix := "halo-backup:v1:"
+	if !strings.HasPrefix(blob, prefix) {
+		return C.CString("error: not a halo backup")
+	}
+	raw, err := base64.StdEncoding.DecodeString(blob[len(prefix):])
+	if err != nil {
+		return C.CString("error: bad base64")
+	}
+	if len(raw) < 16+12+16 {
+		return C.CString("error: blob too short")
+	}
+	salt := raw[:16]
+	rest := raw[16:]
+	key, err := scrypt.Key([]byte(passphrase), salt, 32768, 8, 1, 32)
+	if err != nil {
+		return C.CString("error: scrypt: " + err.Error())
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return C.CString("error: aes: " + err.Error())
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return C.CString("error: gcm: " + err.Error())
+	}
+	nonceSize := gcm.NonceSize()
+	nonce := rest[:nonceSize]
+	ct := rest[nonceSize:]
+	plain, err := gcm.Open(nil, nonce, ct, nil)
+	if err != nil {
+		return C.CString("error: wrong passphrase or corrupt")
+	}
+	return C.CString(string(plain))
+}
+
+// the streamed backup. the v1 blob above holds the whole payload in memory
+// several times over; v2 is written a chunk at a time: one key from the
+// passphrase and a salt, then every record sealed on its own with a nonce
+// made of its index. same scrypt and aes-256-gcm as v1. the record layout
+// lives on the dart side; these three do the cryptography on raw buffers so
+// a chunk is not copied through a c string.
+
+// derives the backup key. salt is exactly 16 bytes. returns the key as
+// hex, or "error: ...".
+//
+//export HaloBackupKey
+func HaloBackupKey(cPassphrase *C.char, cSalt *C.uchar) *C.char {
+	salt := C.GoBytes(unsafe.Pointer(cSalt), 16)
+	key, err := scrypt.Key([]byte(C.GoString(cPassphrase)), salt, 32768, 8, 1, 32)
+	if err != nil {
+		return C.CString("error: scrypt: " + err.Error())
+	}
+	return C.CString(hex.EncodeToString(key))
+}
+
+func backupGCM(keyHex string) (cipher.AEAD, error) {
+	key, err := hex.DecodeString(keyHex)
+	if err != nil || len(key) != 32 {
+		return nil, fmt.Errorf("bad key")
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
+}
+
+// the nonce is the record index, so no two records under one key share
+// one, and a record moved to another place in the file fails to open.
+// the record type rides as additional data for the same reason.
+func backupNonce(index uint64) []byte {
+	n := make([]byte, 12)
+	for i := 0; i < 8; i++ {
+		n[11-i] = byte(index >> (8 * i))
+	}
+	return n
+}
+
+// seals inLen bytes at in into out, which must have room for inLen+16.
+// returns the sealed length, or -1.
+//
+//export HaloSealChunk
+func HaloSealChunk(cKey *C.char, index C.ulonglong, typ C.uchar, in *C.uchar, inLen C.int, out *C.uchar) C.int {
+	gcm, err := backupGCM(C.GoString(cKey))
+	if err != nil || inLen < 0 {
+		return -1
+	}
+	plain := C.GoBytes(unsafe.Pointer(in), inLen)
+	ct := gcm.Seal(nil, backupNonce(uint64(index)), plain, []byte{byte(typ)})
+	dst := unsafe.Slice((*byte)(unsafe.Pointer(out)), len(ct))
+	copy(dst, ct)
+	return C.int(len(ct))
+}
+
+// opens inLen sealed bytes at in into out, which must have room for inLen.
+// returns the plaintext length, or -1 when the passphrase is wrong, the
+// record was moved, or the bytes were changed.
+//
+//export HaloOpenChunk
+func HaloOpenChunk(cKey *C.char, index C.ulonglong, typ C.uchar, in *C.uchar, inLen C.int, out *C.uchar) C.int {
+	gcm, err := backupGCM(C.GoString(cKey))
+	if err != nil || inLen < 16 {
+		return -1
+	}
+	ct := C.GoBytes(unsafe.Pointer(in), inLen)
+	plain, err := gcm.Open(nil, backupNonce(uint64(index)), ct, []byte{byte(typ)})
+	if err != nil {
+		return -1
+	}
+	dst := unsafe.Slice((*byte)(unsafe.Pointer(out)), len(plain))
+	copy(dst, plain)
+	return C.int(len(plain))
+}
+
+// watchHSDirUpload reads tor's HS_DESC events and returns true as soon as
+// our descriptor is uploaded, or false after 120s. most networks upload
+// within 5-15 seconds.
+func watchHSDirUpload(t *tor.Tor, ch chan control.Event, subbed bool, onionID string) bool {
+	if t == nil || t.Control == nil || !subbed {
+		time.Sleep(120 * time.Second)
+		return false
+	}
+
+	timeout := time.After(120 * time.Second)
+	// how many hsdirs we have handed the descriptor to. the hashring is six
+	// per replica, so three is a comfortable majority of one replica and the
+	// descriptor is fetchable well before that.
+	uploads := 0
+	const enough = 3
+	for {
+		select {
+		case ev := <-ch:
+			hs, ok := ev.(*control.HSDescEvent)
+			if !ok {
+				continue
+			}
+			// log every action, not just the two we care about. an upload
+			// that is never attempted looks identical to one that fails if
+			// you only watch for FAILED.
+			mine := hs.Address == onionID || hs.Address == onionID+".onion"
+			log.Printf(
+				"halo: HS_DESC %s addr=%s hsdir=%s reason=%s mine=%t",
+				hs.Action, hs.Address, hs.HSDir, hs.Reason, mine,
+			)
+			if hs.Action == "UPLOAD" && mine {
+				uploads++
+				statusMu.Lock()
+				hsdirUploads = uploads
+				statusMu.Unlock()
+				if uploads == enough {
+					log.Printf(
+						"halo: descriptor handed to %d hsdirs, treating as published",
+						uploads,
+					)
+					return true
+				}
+			}
+			if hs.Action == "UPLOADED" && mine {
+				log.Printf("halo: HS_DESC UPLOADED received for %s", onionID)
+				return true
+			}
+		case <-timeout:
+			log.Printf("halo: WARN no HSDir upload confirmed in 120s - staying in publishing, still trying")
+			return false
+		}
+	}
+}
+
+// polls tor for real bootstrap progress. tor.Start only means the process
+// is up; the network comes alive inside Listen, so this is the only true
+// progress signal. stops at 100% or after about ten minutes.
+func watchBootstrap(t *tor.Tor) {
+	lastPct := -1
+	for i := 0; i < 300; i++ {
+		if t == nil || t.Control == nil || torIsPaused() {
+			return
+		}
+		var kv []*control.KeyVal
+		err := ctrlDo(t, "GETINFO bootstrap-phase", func(c *control.Conn) error {
+			var gerr error
+			kv, gerr = c.GetInfo("status/bootstrap-phase")
+			return gerr
+		})
+		if err == nil && len(kv) > 0 {
+			pct := parseBootstrapPct(kv[0].Val)
+			if pct != lastPct {
+				lastPct = pct
+				statusMu.Lock()
+				bootstrapPct = pct
+				noteBootstrapProgress(pct)
+				statusMu.Unlock()
+				log.Printf("halo: tor bootstrap %d%%", pct)
+			}
+			if pct >= 100 {
+				statusMu.Lock()
+				cur := torStatus
+				statusMu.Unlock()
+				if cur != "reachable" {
+					setStatus("publishing")
+					notePublishing()
+				}
+				return
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func parseBootstrapPct(v string) int {
+	i := strings.Index(v, "PROGRESS=")
+	if i < 0 {
+		return 0
+	}
+	v = v[i+len("PROGRESS="):]
+	n := 0
+	for _, c := range v {
+		if c < '0' || c > '9' {
+			break
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
+}

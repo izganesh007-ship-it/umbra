@@ -1,0 +1,2366 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// home screen: date header, the chat list or empty state, and the nav tabs.
+
+import 'saved_screen.dart';
+import 'transport_screen.dart';
+import '../widgets/press_scale.dart';
+import 'modes_screen.dart' show showFastGateSheet;
+import '../widgets/stagger_in.dart';
+import '../widgets/breathing_ring.dart';
+import 'requests_screen.dart';
+import 'dart:async';
+import 'package:flutter/material.dart';
+import 'donate_screen.dart';
+import 'profile_screen.dart';
+import 'tools_screen_new.dart';
+import 'clean_screen.dart';
+import 'photo_knows_screen.dart';
+import 'qr_screen.dart';
+import 'lock_file_screen.dart';
+import 'open_locked_screen.dart';
+import '../tools/tools_bridge.dart';
+import '../lock_state.dart';
+import '../widgets/nav_bar.dart';
+import 'package:flutter/services.dart';
+import '../theme/theme.dart';
+import '../widgets/room_countdown.dart';
+import '../widgets/kryfo_avatar.dart';
+import 'notes_screen.dart';
+import 'bridges_screen.dart';
+import 'archived_screen.dart';
+import '../miui_autostart.dart';
+import '../main.dart';
+import '../widgets/motion.dart';
+import '../widgets/halo_sheet.dart';
+import '../widgets/sheet_handle.dart';
+import '../widgets/shift_in_place.dart';
+import '../widgets/confirm_sheet.dart';
+import '../notif_permission.dart';
+import '../delivery_mode.dart';
+import '../l10n/l10n.dart';
+import '../l10n/dates.dart';
+import '../l10n/numbers.dart';
+
+bool _miuiPromptChecked = false;
+
+class HomeScreen extends StatefulWidget {
+  final String haloId; // "neon-tiger-saturn"
+  final List<ContactPreview> contacts;
+  final List<GroupSummary> groups;
+  final int pendingCount;
+  final VoidCallback onAddContact;
+  final VoidCallback onNewGroup;
+  final VoidCallback onNewRoom;
+  final String? expiredRoomName;
+  final VoidCallback onOpenDev;
+  final VoidCallback onOpenSettingsDirect;
+  final void Function(String kryfo) onOpenChat;
+  final void Function(String groupId) onOpenGroup;
+
+  const HomeScreen({
+    super.key,
+    required this.haloId,
+    this.contacts = const [],
+    this.groups = const [],
+    required this.onAddContact,
+    required this.onNewGroup,
+    required this.onNewRoom,
+    this.expiredRoomName,
+    required this.onOpenDev,
+    required this.onOpenSettingsDirect,
+    this.pendingCount = 0,
+    required this.onOpenChat,
+    required this.onOpenGroup,
+  });
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  HaloTab _tab = HaloTab.chats;
+  final Set<HaloTab> _seen = {HaloTab.chats};
+  StreamSubscription<void>? _sharedSub;
+  Timer? _sweeper;
+  Widget? _heldTool;
+
+  @override
+  void initState() {
+    super.initState();
+    _sharedSub = ToolsBridge.instance.shared.listen((_) => _takeShared());
+    lockState.addListener(_onLock);
+    // a tab opened once stays in the tree behind an Offstage, so a theme
+    // switch has to repaint the tabs behind this one too
+    themeRevision.addListener(_repaint);
+    ToolsBridge.instance.sweep();
+    _sweeper = Timer.periodic(
+      const Duration(minutes: 5),
+      (_) => ToolsBridge.instance.sweep(),
+    );
+    WidgetsBinding.instance.addPostFrameCallback((_) => _takeShared());
+  }
+
+  @override
+  void dispose() {
+    _sharedSub?.cancel();
+    lockState.removeListener(_onLock);
+    themeRevision.removeListener(_repaint);
+    _sweeper?.cancel();
+    super.dispose();
+  }
+
+  void _repaint() {
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _takeShared() async {
+    final f = await ToolsBridge.instance.takeShared();
+    if (f != null) _clean(f);
+  }
+
+  Future<void> _pickToClean() async {
+    final f = await ToolsBridge.instance.pick('media');
+    if (f != null) _clean(f);
+  }
+
+  Future<void> _pickToRead(String kind) async {
+    final f = await ToolsBridge.instance.pick(kind);
+    if (f != null) _openTool(PhotoKnowsScreen(file: f));
+  }
+
+  Future<void> _pickFor(Widget Function(PickedFile) screen) async {
+    final f = await ToolsBridge.instance.pick('any');
+    if (f != null) _openTool(screen(f));
+  }
+
+  void _clean(PickedFile f) => _openTool(CleanScreen(file: f));
+
+  // the lock is a route on this same navigator. opening a tool under it, or
+  // clearing the stack to make room for one, would take the lock away, so a
+  // share or a pick that lands while locked waits for the pin.
+  void _openTool(Widget screen) {
+    if (!mounted) return;
+    if (!lockState.loaded || lockState.locked) {
+      _heldTool = screen;
+      return;
+    }
+    final nav = Navigator.of(context);
+    nav.popUntil((r) => r.isFirst);
+    _pick(HaloTab.tools);
+    nav.push(haloRoute(screen));
+  }
+
+  void _onLock() {
+    final held = _heldTool;
+    if (held == null || !lockState.loaded || lockState.locked) return;
+    _heldTool = null;
+    WidgetsBinding.instance.addPostFrameCallback((_) => _openTool(held));
+  }
+
+  void _pick(HaloTab t) {
+    if (t == _tab) return;
+    setState(() {
+      _tab = t;
+      _seen.add(t);
+    });
+  }
+
+  Widget _body(HaloTab t) {
+    switch (t) {
+      case HaloTab.chats:
+        return _ChatsTab(
+          haloId: widget.haloId,
+          contacts: widget.contacts,
+          groups: widget.groups,
+          pendingCount: widget.pendingCount,
+          onAddContact: widget.onAddContact,
+          onNewGroup: widget.onNewGroup,
+          onNewRoom: widget.onNewRoom,
+          expiredRoomName: widget.expiredRoomName,
+          onOpenSettingsDirect: widget.onOpenSettingsDirect,
+          onOpenChat: widget.onOpenChat,
+          onOpenGroup: widget.onOpenGroup,
+        );
+      case HaloTab.tools:
+        return ToolsScreen(
+          onPickPhoto: () => _pickToRead('image'),
+          onPickVideo: () => _pickToRead('video'),
+          onClean: _pickToClean,
+          onQr: () => _openTool(const QrScreen()),
+          onLock: () => _pickFor((f) => LockFileScreen(file: f)),
+          onOpenLocked: () => _pickFor((f) => OpenLockedScreen(file: f)),
+        );
+      case HaloTab.support:
+        return const DonateScreen();
+      case HaloTab.me:
+        return ProfileScreen(onOpenSupport: () => _pick(HaloTab.support));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+  final themeController = UmbraTheme.of(context);
+
+  final colors = UmbraTheme.colorsOf(context);
+
+    return PopScope(
+      canPop: _tab == HaloTab.chats,
+      onPopInvokedWithResult: (done, _) {
+        if (!done) _pick(HaloTab.chats);
+      },
+      child: Scaffold(
+        backgroundColor: colors.surface,
+        body: Column(
+          children: [
+            Expanded(
+              child: MediaQuery.removePadding(
+                context: context,
+                removeBottom: true,
+                child: Stack(
+                  children: [
+                    for (final t in HaloTab.values)
+                      if (_seen.contains(t))
+                        Offstage(
+                          offstage: t != _tab,
+                          child: TickerMode(
+                            enabled: t == _tab,
+                            // keyed on the theme so a switch rebuilds the
+                            // whole tab from scratch. HaloColors is a palette
+                            // swapped in place, and a const widget handed back
+                            // to a rebuild is skipped, so anything const in
+                            // here would keep the colours it was built with.
+                            child: KeyedSubtree(
+                              key: ValueKey(themeController.isLight),
+                              child: _Arrive(on: t == _tab, child: _body(t)),
+                            ),
+                          ),
+                        ),
+                  ],
+                ),
+              ),
+            ),
+            SafeArea(
+              top: false,
+              child: HaloNavBar(
+                active: _tab,
+                onPick: _pick,
+                onMeLongPress: widget.onOpenDev,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _Arrive extends StatefulWidget {
+  final bool on;
+  final Widget child;
+  const _Arrive({required this.on, required this.child});
+  @override
+  State<_Arrive> createState() => _ArriveState();
+}
+
+class _ArriveState extends State<_Arrive> with SingleTickerProviderStateMixin {
+  late final AnimationController _c = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 280),
+    value: 1,
+  );
+
+  @override
+  void didUpdateWidget(_Arrive old) {
+    super.didUpdateWidget(old);
+    if (!widget.on || old.on) return;
+    if (MediaQuery.maybeOf(context)?.disableAnimations ?? false) return;
+    _c.forward(from: 0);
+  }
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    final a = CurvedAnimation(parent: _c, curve: UmbraMotion.easeOut);
+    return FadeTransition(
+      opacity: a,
+      child: AnimatedBuilder(
+        animation: a,
+        builder: (_, child) => Transform.translate(
+          offset: Offset(0, 8 * (1 - a.value)),
+          child: child,
+        ),
+        child: widget.child,
+      ),
+    );
+  }
+}
+
+class _ChatsTab extends StatelessWidget {
+  final String haloId; // "neon-tiger-saturn"
+  final List<ContactPreview> contacts;
+  final List<GroupSummary> groups;
+  final int pendingCount;
+  final VoidCallback onAddContact;
+  final VoidCallback onNewGroup;
+  final VoidCallback onNewRoom;
+  final String? expiredRoomName;
+  final VoidCallback onOpenSettingsDirect;
+  final void Function(String kryfo) onOpenChat;
+  final void Function(String groupId) onOpenGroup;
+
+  const _ChatsTab({
+    required this.haloId,
+    this.contacts = const [],
+    this.groups = const [],
+    required this.onAddContact,
+    required this.onNewGroup,
+    required this.onNewRoom,
+    this.expiredRoomName,
+    required this.onOpenSettingsDirect,
+    this.pendingCount = 0,
+    required this.onOpenChat,
+    required this.onOpenGroup,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    final now = DateTime.now();
+    final visible = contacts.where((c) => !c.archived).toList();
+    final hasArchived = contacts.any((c) => c.archived);
+    if (!_miuiPromptChecked) {
+      _miuiPromptChecked = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        maybeShowBackgroundPrompt(context);
+      });
+    }
+    return SafeArea(
+      bottom: false,
+      child: Column(
+        children: [
+          StaggerIn(
+            index: 0,
+            child: _HomeHead(
+              now: now,
+              haloId: haloId,
+              onAdd: onAddContact,
+              onSettings: onOpenSettingsDirect,
+            ),
+          ),
+          const _OfflineStrip(),
+          const _BridgeHint(),
+          const _BridgeStuckHint(),
+          const _RelayDownHint(),
+          const _OfflineCard(),
+          const _KeepsStoppingCard(),
+          const _NotificationsBlockedHint(),
+          StaggerIn(
+            index: 1,
+            child: _QuickTiles(
+              onNotes: () =>
+                  Navigator.of(context).push(haloRoute(const NotesScreen())),
+              onSaved: () =>
+                  Navigator.of(context).push(haloRoute(const SavedScreen())),
+            ),
+          ),
+          if (pendingCount > 0)
+            StaggerIn(
+              index: 2,
+              child: _RequestsPin(
+                count: pendingCount,
+                onTap: () => Navigator.of(
+                  context,
+                ).push(haloRoute(const RequestsScreen())),
+              ),
+            ),
+          if (hasArchived)
+            _ArchivedPin(
+              count: contacts.where((c) => c.archived).length,
+              onTap: () {
+                HapticFeedback.selectionClick();
+                Navigator.of(context).push(_archivedRoute());
+              },
+            ),
+          Expanded(
+            child: visible.isEmpty && groups.isEmpty
+                ? _EmptyState(onAdd: onAddContact)
+                : _ContactList(
+                    contacts: visible,
+                    groups: groups,
+                    onTap: onOpenChat,
+                    onOpenGroup: onOpenGroup,
+                    onNewGroup: onNewGroup,
+                    onNewRoom: onNewRoom,
+                    expiredRoomName: expiredRoomName,
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+Route<void> _archivedRoute() {
+  return PageRouteBuilder<void>(
+    transitionDuration: const Duration(milliseconds: 280),
+    reverseTransitionDuration: const Duration(milliseconds: 260),
+    pageBuilder: (_, _, _) => const ArchivedScreen(),
+    transitionsBuilder: (_, anim, _, child) {
+      final curved = CurvedAnimation(
+        parent: anim,
+        curve: UmbraMotion.easeOut,
+        reverseCurve: Curves.easeInCubic,
+      );
+      return FadeTransition(
+        opacity: curved,
+        child: SlideTransition(
+          position: Tween(
+            begin: const Offset(0, 0.06),
+            end: Offset.zero,
+          ).animate(curved),
+          child: child,
+        ),
+      );
+    },
+  );
+}
+
+class ContactPreview {
+  final String haloId;
+  final String? nickname;
+  final String? preview;
+  final DateTime? when;
+  final String avatarSeed;
+  // the face they picked, if they have. null means draw from their id.
+  final int? avatar;
+  final bool blocked;
+  final bool archived;
+  final bool muted;
+  final bool verified;
+  final int unread;
+  final bool pinned;
+  final String? supporterBadge;
+  ContactPreview({
+    required this.haloId,
+    this.nickname,
+    this.preview,
+    this.when,
+    required this.avatarSeed,
+    this.avatar,
+    this.blocked = false,
+    this.archived = false,
+    this.muted = false,
+    this.verified = false,
+    this.unread = 0,
+    this.pinned = false,
+    this.supporterBadge,
+  });
+}
+
+// minimal shape needed by home for rendering a group row. main.dart
+// builds these from appState.groups.
+class GroupSummary {
+  final String groupId;
+  final String name;
+  final int memberCount;
+  final int unread;
+  final bool mentioned;
+  final int? expiresAt; // set for a burner room
+  const GroupSummary({
+    required this.groupId,
+    required this.name,
+    required this.memberCount,
+    this.unread = 0,
+    this.mentioned = false,
+    this.expiresAt,
+  });
+  bool get isRoom => expiresAt != null;
+}
+
+// ───────── date header ─────────
+
+// the relay route's colour: cool enough never to read as tor's violet
+const kRelayCyan = Color(0xFF4BB8C9);
+
+class _AddScanButton extends StatelessWidget {
+  final VoidCallback onTap;
+  const _AddScanButton({required this.onTap});
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return PressScale(
+      onTap: onTap,
+      child: Container(
+        width: 38,
+        height: 38,
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          border: Border.all(
+            color: colors.accent.withValues(alpha: 0.55),
+            width: 1.4,
+          ),
+        ),
+        child: Semantics(
+          label: l10n.homeAddAContact,
+          button: true,
+          child: Icon(Icons.add, size: 20, color: colors.accent),
+        ),
+      ),
+    );
+  }
+}
+
+class _GearButton extends StatefulWidget {
+  final VoidCallback onTap;
+  const _GearButton({required this.onTap});
+  @override
+  State<_GearButton> createState() => _GearButtonState();
+}
+
+class _GearButtonState extends State<_GearButton> {
+  double _s = 1.0;
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return Semantics(
+      label: l10n.commonSettings,
+      button: true,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTapDown: (_) => setState(() => _s = 0.9),
+        onTapUp: (_) => setState(() => _s = 1.0),
+        onTapCancel: () => setState(() => _s = 1.0),
+        onTap: () {
+          HapticFeedback.selectionClick();
+          widget.onTap();
+        },
+        child: AnimatedScale(
+          scale: _s,
+          duration: const Duration(milliseconds: 110),
+          curve: UmbraMotion.easeOut,
+          child: Container(
+            width: 38,
+            height: 38,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              border: Border.all(color: colors.separatorStrong, width: 1.4),
+            ),
+            child: Icon(
+              Icons.settings_outlined,
+              size: 19,
+              color: colors.textSecondary,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _HomeHead extends StatelessWidget {
+  final DateTime now;
+  final String haloId;
+  final VoidCallback onAdd;
+  final VoidCallback onSettings;
+  const _HomeHead({
+    required this.now,
+    required this.haloId,
+    required this.onAdd,
+    required this.onSettings,
+  });
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 14, 20, 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // one line each, shrunk to fit rather than broken: a long
+                // weekday or month ("Donnerstag", "24. September") beside the
+                // buttons would split in the middle of the word
+                FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: AlignmentDirectional.centerStart,
+                  child: Text(
+                    l10n.homeDateWeekday(weekday(now)),
+                    maxLines: 1,
+                    style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 26, fontWeight: FontWeight.w400, fontStyle: FontStyle.normal, height: 1.05, letterSpacing: -0.015),
+                    // display type, capped: at 200% it goes one word per line
+                    // and pushes the whole list off screen
+                    textScaler: TextScaler.linear(
+                      MediaQuery.of(
+                        context,
+                      ).textScaler.scale(1).clamp(1.0, 1.15),
+                    ),
+                  ),
+                ),
+                FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: AlignmentDirectional.centerStart,
+                  child: Text(
+                    dayMonthLong(now),
+                    maxLines: 1,
+                    style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 26, fontWeight: FontWeight.w300, color: colors.accent, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+                    textScaler: TextScaler.linear(
+                      MediaQuery.of(
+                        context,
+                      ).textScaler.scale(1).clamp(1.0, 1.15),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  l10n.homeYourKryfo,
+                  style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 9.5, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.14),
+                ),
+                const SizedBox(height: 3),
+                FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: AlignmentDirectional.centerStart,
+                  child: Text(
+                    haloId,
+                    maxLines: 1,
+                    softWrap: false,
+                    style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 20, fontWeight: FontWeight.w700, color: colors.accent, letterSpacing: 0.02),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          _GearButton(onTap: onSettings),
+          const SizedBox(width: 10),
+          _AddScanButton(onTap: onAdd),
+          const SizedBox(width: 12),
+          TorHalo(label: true),
+        ],
+      ),
+    );
+  }
+}
+
+// android is not letting kryfo put a notification up, so nothing arrives
+// while the app is closed. the android 13 permission dialog does not come
+// back once the answer is final, so the only way out is the page this opens.
+class _NotificationsBlockedHint extends StatefulWidget {
+  const _NotificationsBlockedHint();
+
+  @override
+  State<_NotificationsBlockedHint> createState() =>
+      _NotificationsBlockedHintState();
+}
+
+// tor has been unable to carry traffic for five minutes while kryfo is meant
+// to be connected: say so plainly and offer the one useful button. it keeps
+// its own timer because the status poll only wakes listeners when the status
+// changes, and staying off is the absence of a change.
+class _OfflineCard extends StatefulWidget {
+  const _OfflineCard();
+
+  @override
+  State<_OfflineCard> createState() => _OfflineCardState();
+}
+
+class _OfflineCardState extends State<_OfflineCard> {
+  Timer? _tick;
+  bool _busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _tick = Timer.periodic(const Duration(seconds: 20), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _tick?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _reconnect() async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    HapticFeedback.selectionClick();
+    engine.restartTor();
+    // the bounce reports itself through the status poll; this only stops the
+    // button being hammered while it runs.
+    await Future<void>.delayed(const Duration(seconds: 6));
+    if (mounted) setState(() => _busy = false);
+  }
+
+  String _howLong(Duration d) {
+    if (d.inHours >= 1) {
+      final h = d.inHours;
+      return h == 1 ? l10n.homeAnHour : l10n.homeHours(h);
+    }
+    return l10n.homeMinutes(d.inMinutes);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return AnimatedBuilder(
+      animation: appState,
+      builder: (context, _) {
+        if (!appState.looksOffline) return const SizedBox.shrink();
+        final since = appState.offlineFor ?? Duration.zero;
+        return Container(
+          margin: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+          padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+          decoration: BoxDecoration(
+            color: colors.error.withValues(alpha: 0.10),
+            borderRadius: BorderRadius.circular(UmbraRadius.xl),
+            border: Border.all(color: colors.error.withValues(alpha: 0.35)),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  BreathDot(color: colors.error, size: 7),
+                  const SizedBox(width: 9),
+                  Text(
+                    l10n.homeKryfoIsOffline,
+                    style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11, fontWeight: FontWeight.w600, color: colors.error, letterSpacing: 0.12),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Text(
+                l10n.homeTorHasNotBeen(_howLong(since)),
+                style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  GestureDetector(
+                    onTap: _busy ? null : _reconnect,
+                    behavior: HitTestBehavior.opaque,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 15,
+                        vertical: 8,
+                      ),
+                      decoration: BoxDecoration(
+                        color: _busy
+                            ? colors.error.withValues(alpha: 0.45)
+                            : colors.error,
+                        borderRadius: BorderRadius.circular(999),
+                      ),
+                      child: Text(
+                        _busy ? l10n.homeReconnecting : l10n.homeReconnect,
+                        style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11.5, fontWeight: FontWeight.w600, color: colors.ink, letterSpacing: 0.12),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  GestureDetector(
+                    onTap: () => Navigator.of(
+                      context,
+                    ).push(haloRoute(const TransportScreen())),
+                    behavior: HitTestBehavior.opaque,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
+                      child: Text(
+                        l10n.homeWhatIsWrong,
+                        style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11.5, fontWeight: FontWeight.w500, color: colors.textSecondary, letterSpacing: 0.12),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+// this phone has killed kryfo three times in a day while it was supposed
+// to be staying connected. said once, ever, and only after it has happened:
+// no vendor list, no guessing from the model name.
+class _KeepsStoppingCard extends StatefulWidget {
+  const _KeepsStoppingCard();
+
+  @override
+  State<_KeepsStoppingCard> createState() => _KeepsStoppingCardState();
+}
+
+class _KeepsStoppingCardState extends State<_KeepsStoppingCard> {
+  bool _busy = false;
+
+  Future<void> _switch() async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    await appState.setDeliveryMode(DeliveryMode.checkins);
+    await appState.nudgeAnswered();
+    if (!mounted) return;
+    showHaloToast(context, l10n.homeKryfoWillCheckIn);
+    unawaited(forceShowBackgroundPrompt(context));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return AnimatedBuilder(
+      animation: appState,
+      builder: (context, _) {
+        if (!appState.nudgeDue) return const SizedBox.shrink();
+        return Container(
+          margin: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+          padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+          decoration: BoxDecoration(
+            color: colors.accent.withValues(alpha: 0.10),
+            borderRadius: BorderRadius.circular(UmbraRadius.xl),
+            border: Border.all(color: colors.accent.withValues(alpha: 0.35)),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  BreathDot(color: colors.accent, size: 7),
+                  const SizedBox(width: 9),
+                  Text(
+                    l10n.homeYourPhoneKeepsStopping,
+                    style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11, fontWeight: FontWeight.w600, color: colors.accent, letterSpacing: 0.12),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Text(
+                l10n.homeItHasClosedKryfo,
+                style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  GestureDetector(
+                    onTap: _switch,
+                    behavior: HitTestBehavior.opaque,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 15,
+                        vertical: 8,
+                      ),
+                      decoration: BoxDecoration(
+                        color: colors.accent,
+                        borderRadius: BorderRadius.circular(999),
+                      ),
+                      child: Text(
+                        l10n.homeSwitchToCheckIns,
+                        style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11.5, fontWeight: FontWeight.w600, color: colors.ink, letterSpacing: 0.12),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  GestureDetector(
+                    onTap: () => appState.nudgeAnswered(),
+                    behavior: HitTestBehavior.opaque,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
+                      child: Text(
+                        l10n.homeNotNow,
+                        style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11.5, fontWeight: FontWeight.w500, color: colors.textSecondary, letterSpacing: 0.12),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _NotificationsBlockedHintState extends State<_NotificationsBlockedHint>
+    with WidgetsBindingObserver {
+  bool _show = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _check();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  // coming back from android's settings is the moment the answer changes
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) _check();
+  }
+
+  Future<void> _check() async {
+    final on = await notificationsEnabled();
+    if (on) await clearNotifHintDismissal();
+    final show = !on && !await notifHintDismissed();
+    if (mounted && show != _show) setState(() => _show = show);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    if (!_show) return const SizedBox.shrink();
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+      decoration: BoxDecoration(
+        color: colors.accent.withValues(alpha: 0.10),
+        borderRadius: BorderRadius.circular(UmbraRadius.xl),
+        border: Border.all(color: colors.accent.withValues(alpha: 0.35)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              BreathDot(color: colors.accent, size: 7),
+              const SizedBox(width: 9),
+              Text(
+                l10n.homeNotificationsAreOff,
+                style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11, fontWeight: FontWeight.w600, color: colors.accent, letterSpacing: 0.12),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            l10n.homeAndroidIsBlockingThem,
+            style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              GestureDetector(
+                onTap: () async {
+                  final opened = await openNotificationSettings();
+                  if (!opened && context.mounted) {
+                    showHaloToast(context, l10n.homeCouldnTOpenIt);
+                  }
+                },
+                behavior: HitTestBehavior.opaque,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 15,
+                    vertical: 8,
+                  ),
+                  decoration: BoxDecoration(
+                    color: colors.accent,
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: Text(
+                    l10n.homeTurnThemOn,
+                    style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11.5, fontWeight: FontWeight.w600, color: colors.ink, letterSpacing: 0.12),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 6),
+              GestureDetector(
+                onTap: () async {
+                  await dismissNotifHint();
+                  if (mounted) setState(() => _show = false);
+                },
+                behavior: HitTestBehavior.opaque,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 8,
+                  ),
+                  child: Text(
+                    l10n.homeLeaveThemOff,
+                    style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11.5, fontWeight: FontWeight.w500, color: colors.textSecondary, letterSpacing: 0.12),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RelayDownHint extends StatelessWidget {
+  const _RelayDownHint();
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return ListenableBuilder(
+      listenable: appState,
+      builder: (context, _) {
+        if (!appState.suggestFastFallback) return const SizedBox.shrink();
+        return Container(
+          margin: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+          padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+          decoration: BoxDecoration(
+            color: colors.accent.withValues(alpha: 0.10),
+            borderRadius: BorderRadius.circular(UmbraRadius.xl),
+            border: Border.all(color: colors.accent.withValues(alpha: 0.35)),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  BreathDot(color: colors.accent, size: 7),
+                  const SizedBox(width: 9),
+                  Text(
+                    l10n.homeOurRelayIsQuiet,
+                    style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11, fontWeight: FontWeight.w600, color: colors.accent, letterSpacing: 0.12),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Text(
+                l10n.homeRelayModeUsesOnly,
+                style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+              ),
+              const SizedBox(height: 13),
+              Row(
+                children: [
+                  GestureDetector(
+                    onTap: () async {
+                      HapticFeedback.selectionClick();
+                      // same warning as the modes screen: fast mode shows
+                      // your address to public relays
+                      final ok = await showFastGateSheet(context);
+                      if (!ok || !context.mounted) return;
+                      await appState.setSendMode('fast');
+                      if (context.mounted) {
+                        showHaloToast(context, l10n.homeSwitchedToFast);
+                      }
+                    },
+                    behavior: HitTestBehavior.opaque,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 15,
+                        vertical: 8,
+                      ),
+                      decoration: BoxDecoration(
+                        color: colors.accent,
+                        borderRadius: BorderRadius.circular(999),
+                      ),
+                      child: Text(
+                        l10n.homeUseFastMode,
+                        style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11.5, fontWeight: FontWeight.w600, color: colors.ink, letterSpacing: 0.12),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  GestureDetector(
+                    onTap: () => appState.dismissRelayHint(),
+                    behavior: HitTestBehavior.opaque,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
+                      child: Text(
+                        l10n.homeKeepWaiting,
+                        style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11.5, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.12),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _BridgeStuckHint extends StatelessWidget {
+  const _BridgeStuckHint();
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return ListenableBuilder(
+      listenable: appState,
+      builder: (context, _) {
+        if (!appState.suggestBridgesOff) return const SizedBox.shrink();
+        return Container(
+          margin: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+          padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+          decoration: BoxDecoration(
+            color: colors.error.withValues(alpha: 0.10),
+            borderRadius: BorderRadius.circular(UmbraRadius.xl),
+            border: Border.all(color: colors.error.withValues(alpha: 0.35)),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  BreathDot(color: colors.error, size: 7),
+                  const SizedBox(width: 9),
+                  Text(
+                    l10n.homeNotConnecting,
+                    style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11, fontWeight: FontWeight.w600, color: colors.error, letterSpacing: 0.12),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Text(
+                l10n.homeBridgesAreOnAnd,
+                style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+              ),
+              const SizedBox(height: 13),
+              GestureDetector(
+                onTap: () async {
+                  HapticFeedback.selectionClick();
+                  await appState.applyBridges(appState.bridgeLines, false);
+                  engine.restartTor();
+                  if (context.mounted) {
+                    showHaloToast(context, l10n.homeGoingDirectReconnecting);
+                  }
+                },
+                behavior: HitTestBehavior.opaque,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 15,
+                    vertical: 8,
+                  ),
+                  decoration: BoxDecoration(
+                    color: colors.error,
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: Text(
+                    l10n.homeTurnBridgesOff,
+                    style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11.5, fontWeight: FontWeight.w600, color: colors.textPrimary, letterSpacing: 0.12),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _BridgeHint extends StatelessWidget {
+  const _BridgeHint();
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return ListenableBuilder(
+      listenable: appState,
+      builder: (context, _) {
+        if (!appState.suggestBridges) return const SizedBox.shrink();
+        return Container(
+          margin: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+          padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: [
+                colors.accent.withValues(alpha: 0.16),
+                colors.accent.withValues(alpha: 0.05),
+              ],
+            ),
+            borderRadius: BorderRadius.circular(UmbraRadius.xl),
+            border: Border.all(
+              color: colors.accent.withValues(alpha: 0.35),
+            ),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  BreathDot(color: colors.accent, size: 7),
+                  const SizedBox(width: 9),
+                  Text(
+                    l10n.homeStillTrying,
+                    style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11, fontWeight: FontWeight.w600, color: colors.accent, letterSpacing: 0.12),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Text(
+                l10n.homeTorIsNotGetting,
+                style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+              ),
+              const SizedBox(height: 13),
+              Row(
+                children: [
+                  GestureDetector(
+                    onTap: () async {
+                      HapticFeedback.selectionClick();
+                      await appState.setSendMode('balanced');
+                      if (context.mounted) {
+                        showHaloToast(context, l10n.homeSwitchedToRelay);
+                      }
+                    },
+                    behavior: HitTestBehavior.opaque,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 15,
+                        vertical: 8,
+                      ),
+                      decoration: BoxDecoration(
+                        color: kRelayCyan,
+                        borderRadius: BorderRadius.circular(999),
+                      ),
+                      child: Text(
+                        l10n.homeUseOurRelay,
+                        style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11.5, fontWeight: FontWeight.w600, color: colors.ink, letterSpacing: 0.12),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  GestureDetector(
+                    onTap: () {
+                      HapticFeedback.selectionClick();
+                      Navigator.of(
+                        context,
+                      ).push(haloRoute(const BridgesScreen()));
+                    },
+                    behavior: HitTestBehavior.opaque,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
+                      child: Text(
+                        l10n.homeBridges,
+                        style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11.5, fontWeight: FontWeight.w600, color: colors.accent, letterSpacing: 0.12),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  GestureDetector(
+                    onTap: () => appState.dismissBridgeHint(),
+                    behavior: HitTestBehavior.opaque,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
+                      child: Text(
+                        l10n.homeKeepWaiting,
+                        style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11.5, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.12),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _OfflineStrip extends StatelessWidget {
+  const _OfflineStrip();
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return ListenableBuilder(
+      listenable: appState,
+      builder: (context, _) {
+        final n = appState.queued;
+        final p = appState.parkedQueued;
+        // a send in flight while the phone can send is not news. the strip
+        // speaks when the phone cannot send, or when a message waits on
+        // someone who has not added you back.
+        final cannotSend = !appState.online || !appState.torReady;
+        if (!cannotSend && p == 0) return const SizedBox.shrink();
+
+        final offline = !appState.online;
+        final torDown = !offline && !appState.torReady;
+        // tor coming up is what every launch looks like: with an empty queue
+        // there is nothing to explain. offline is worth stating even with
+        // nothing queued.
+        if (torDown && n == 0 && p == 0) return const SizedBox.shrink();
+        final tint = offline ? colors.error : colors.accent;
+        final head = offline ? l10n.homeOffline : l10n.homeWaiting;
+        // say whether anything is queued, not only that the phone is offline
+        final tail = n == 0
+            ? l10n.homeNothingWaitingToSend
+            : offline
+            ? l10n.homeWaitingSendsWhenYou(n)
+            : torDown
+            ? l10n.homeWaitingTorIsStill(n)
+            : p >= n
+            ? l10n.homeWaitingForThemTo(n)
+            : p > 0
+            ? l10n.homeWaitingForThemToAddYou(n, p)
+            : l10n.homeWaitingSendingNow(n);
+
+        return Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 11),
+          decoration: BoxDecoration(
+            color: tint.withValues(alpha: 0.14),
+            border: Border(
+              bottom: BorderSide(
+                color: tint.withValues(alpha: 0.35),
+                width: 0.5,
+              ),
+            ),
+          ),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              BreathDot(color: tint, size: 7),
+              const SizedBox(width: 10),
+              Text(
+                head,
+                style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 12, fontWeight: FontWeight.w500, color: tint, letterSpacing: 0.08),
+              ),
+              const SizedBox(width: 9),
+              Expanded(
+                child: Text(
+                  tail,
+                  style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11.5, fontWeight: FontWeight.w500, color: tint.withValues(alpha: 0.85, letterSpacing: 0.12),
+                    weight: FontWeight.w500,
+                  ),
+                  maxLines: 2,
+                ),
+              ),
+              if (n > 0 && !offline && !torDown) ...[
+                const SizedBox(width: 8),
+                GestureDetector(
+                  onTap: () {
+                    HapticFeedback.selectionClick();
+                    appState.flushOutboxNow();
+                  },
+                  behavior: HitTestBehavior.opaque,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 7,
+                    ),
+                    decoration: BoxDecoration(
+                      color: tint.withValues(alpha: 0.18),
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                    child: Text(
+                      l10n.commonRetry,
+                      style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11, fontWeight: FontWeight.w600, color: tint, letterSpacing: 0.06),
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+// ───────── empty state ─────────
+
+class _EmptyState extends StatefulWidget {
+  final VoidCallback onAdd;
+  const _EmptyState({required this.onAdd});
+  @override
+  State<_EmptyState> createState() => _EmptyStateState();
+}
+
+class _EmptyStateState extends State<_EmptyState> {
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 40),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            BreathingRing(
+              child: Container(
+                width: 56,
+                height: 56,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: colors.accentSoft,
+                  border: Border.all(
+                    color: colors.accent.withValues(alpha: 0.3),
+                    width: 0.5,
+                  ),
+                ),
+                child: Icon(
+                  Icons.person_add_alt_1_outlined,
+                  color: colors.accent,
+                  size: 26,
+                ),
+              ),
+            ),
+            const SizedBox(height: 14),
+            Text(
+              l10n.homeNoKryfosYet,
+              textAlign: TextAlign.center,
+              style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 22, fontWeight: FontWeight.w300, color: colors.textPrimary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              l10n.homeScanTheirCodeSend,
+              textAlign: TextAlign.center,
+              style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+            ),
+            const SizedBox(height: 22),
+            PressScale(
+              onTap: widget.onAdd,
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 18,
+                  vertical: 10,
+                ),
+                decoration: BoxDecoration(
+                  color: colors.accent,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Text(
+                  l10n.homeAddSomeone,
+                  style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w500, color: colors.accentOn, height: 1, letterSpacing: 0),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ArchivedPin extends StatelessWidget {
+  final VoidCallback onTap;
+  final int count;
+  const _ArchivedPin({required this.onTap, required this.count});
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 6, 16, 6),
+      child: Material(
+        color: colors.surfaceElevated,
+        borderRadius: BorderRadius.circular(14),
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(14),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+            child: Row(
+              children: [
+                Container(
+                  width: 34,
+                  height: 34,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: colors.accentSoft,
+                  ),
+                  alignment: Alignment.center,
+                  child: Icon(
+                    Icons.inventory_2_outlined,
+                    size: 16,
+                    color: colors.accent,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        l10n.homeArchived,
+                        style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w500, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+                      ),
+                      const SizedBox(height: 1),
+                      Text(
+                        l10n.home1Chat(count),
+                        style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.12),
+                      ),
+                    ],
+                  ),
+                ),
+                Icon(Icons.chevron_right, color: colors.textTertiary, size: 18),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ContactList extends StatelessWidget {
+  final List<ContactPreview> contacts;
+  final List<GroupSummary> groups;
+  final void Function(String kryfo) onTap;
+  final void Function(String groupId) onOpenGroup;
+  final VoidCallback onNewGroup;
+  final VoidCallback onNewRoom;
+  final String? expiredRoomName;
+  const _ContactList({
+    required this.contacts,
+    required this.groups,
+    required this.onTap,
+    required this.onOpenGroup,
+    required this.onNewGroup,
+    required this.onNewRoom,
+    this.expiredRoomName,
+  });
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    final rest = contacts;
+    return ListView(
+      padding: EdgeInsets.zero,
+      children: [
+        // groups section (header + rows + new-group tile). always show the
+        // tile so user can create a group even with no existing groups.
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 6, 20, 6),
+          child: Row(
+            children: [
+              Text(
+                l10n.homeGroups,
+                style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.14),
+              ),
+              const Spacer(),
+              GestureDetector(
+                onTap: onNewRoom,
+                behavior: HitTestBehavior.opaque,
+                child: Padding(
+                  padding: const EdgeInsetsDirectional.only(end: 14),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        Icons.timer_outlined,
+                        size: 13,
+                        color: colors.accent,
+                      ),
+                      const SizedBox(width: 3),
+                      Text(
+                        l10n.homeRoom,
+                        style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: colors.accent, letterSpacing: 0.14),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              GestureDetector(
+                onTap: onNewGroup,
+                behavior: HitTestBehavior.opaque,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.add_rounded, size: 14, color: colors.accent),
+                    const SizedBox(width: 3),
+                    Text(
+                      l10n.homeNew,
+                      style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: colors.accent, letterSpacing: 0.14),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+        // a room that just ended: one quiet line, gone in a few seconds
+        if (expiredRoomName != null)
+          _Enter(
+            index: 0,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(20, 4, 20, 8),
+              child: Text(
+                l10n.homeRoomExpired(expiredRoomName!),
+                style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: colors.accent, letterSpacing: 0.12),
+              ),
+            ),
+          ),
+        // keyed, so a row that moves up on a new message glides there
+        ...groups.asMap().entries.map(
+          (e) => ShiftInPlace(
+            key: ValueKey('g-${e.value.groupId}'),
+            index: e.key,
+            child: _Enter(
+              index: 1 + e.key,
+              child: _GroupRow(
+                g: e.value,
+                onTap: () => onOpenGroup(e.value.groupId),
+              ),
+            ),
+          ),
+        ),
+        if (rest.isNotEmpty) ...[
+          ...rest.asMap().entries.map(
+            (e) => ShiftInPlace(
+              key: ValueKey('c-${e.value.haloId}'),
+              index: groups.length + e.key,
+              child: _Enter(
+                index: 1 + groups.length + e.key,
+                child: _SwipeRow(
+                  c: e.value,
+                  onTap: () => onTap(e.value.haloId),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+bool _homeEntered = false;
+
+// one-shot staggered entrance for the home list. plays on the first render
+// after launch, then stays put so message updates never re-animate rows.
+class _Enter extends StatefulWidget {
+  final int index;
+  final Widget child;
+  const _Enter({required this.index, required this.child});
+  @override
+  State<_Enter> createState() => _EnterState();
+}
+
+class _EnterState extends State<_Enter> with SingleTickerProviderStateMixin {
+  late final bool _animate = !_homeEntered;
+  late final AnimationController _c = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 360),
+    value: _animate ? 0.0 : 1.0,
+  );
+
+  @override
+  void initState() {
+    super.initState();
+    if (_animate) {
+      if (!_homeEntered) {
+        WidgetsBinding.instance.addPostFrameCallback(
+          (_) => _homeEntered = true,
+        );
+      }
+      Future.delayed(Duration(milliseconds: widget.index * 45), () {
+        if (mounted) _c.forward();
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    if (!_animate) return widget.child;
+    final curved = CurvedAnimation(parent: _c, curve: UmbraMotion.easeOut);
+    return AnimatedBuilder(
+      animation: curved,
+      child: widget.child,
+      builder: (_, child) => Opacity(
+        opacity: curved.value,
+        child: Transform.translate(
+          offset: Offset(0, 12 * (1 - curved.value)),
+          child: child,
+        ),
+      ),
+    );
+  }
+}
+
+class _GroupRow extends StatelessWidget {
+  final GroupSummary g;
+  final VoidCallback onTap;
+  const _GroupRow({required this.g, required this.onTap});
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return InkWell(
+      onTap: onTap,
+      splashColor: colors.accent.withValues(alpha: 0.10),
+      highlightColor: colors.accent.withValues(alpha: 0.05),
+      child: Ink(
+        decoration: g.unread > 0
+            ? BoxDecoration(
+                color: colors.accent.withValues(alpha: 0.06),
+                border: BorderDirectional(
+                  start: BorderSide(color: colors.accent, width: 2),
+                ),
+              )
+            : null,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          child: Row(
+            children: [
+              // group avatar: a square tile with the first letter of the name
+              // in italic serif, so groups differ from round contact avatars
+              Hero(
+                tag: 'group-${g.groupId}',
+                child: Container(
+                  width: 36,
+                  height: 36,
+                  decoration: BoxDecoration(
+                    color: g.isRoom
+                        ? colors.accent.withValues(alpha: 0.14)
+                        : colors.accentSoft,
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(
+                      color: (g.isRoom ? colors.accent : colors.accent)
+                          .withValues(alpha: 0.35),
+                      width: 0.6,
+                    ),
+                  ),
+                  alignment: Alignment.center,
+                  child: Text(
+                    g.name.isEmpty
+                        ? '·'
+                        : g.name.characters.first.toUpperCase(),
+                    style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 18, fontWeight: FontWeight.w400, color: g.isRoom ? colors.accent : colors.accent, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      g.name,
+                      style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: g.unread > 0
+                            ? FontWeight.w600
+                            : FontWeight.w500, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+                    ),
+                    const SizedBox(height: 2),
+                    if (g.isRoom)
+                      RoomCountdown(expiresAt: g.expiresAt!, size: 10)
+                    else if (g.mentioned)
+                      // your three words came up in there
+                      Text(
+                        l10n.homeMentionedYou,
+                        style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w600, color: colors.accent, letterSpacing: 0.06),
+                      )
+                    else
+                      Text(
+                        l10n.homeMembers(g.memberCount),
+                        style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.12),
+                      ),
+                  ],
+                ),
+              ),
+              if (g.unread > 0) ...[
+                const SizedBox(width: 8),
+                _UnreadBadge(g.unread),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// unread count. pops when the number changes so a message arriving while you
+// are looking at the list is not a silent swap.
+class _UnreadBadge extends StatelessWidget {
+  final int count;
+  const _UnreadBadge(this.count);
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return TweenAnimationBuilder<double>(
+      key: ValueKey(count),
+      tween: Tween(begin: 0.55, end: 1),
+      duration: const Duration(milliseconds: 260),
+      curve: Curves.easeOutBack,
+      builder: (_, t, child) => Transform.scale(scale: t, child: child),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+        constraints: const BoxConstraints(minWidth: 18),
+        decoration: BoxDecoration(
+          color: colors.accent,
+          borderRadius: BorderRadius.circular(9),
+        ),
+        child: Text(
+          count > 99 ? '99+' : '$count',
+          textAlign: TextAlign.center,
+          style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 10, fontWeight: FontWeight.w600, color: colors.accentOn, height: 1.5, letterSpacing: 0),
+        ),
+      ),
+    );
+  }
+}
+
+Widget _supporterPill() {
+  return Container(
+    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+    decoration: BoxDecoration(
+      color: colors.accent.withValues(alpha: 0.18),
+      borderRadius: BorderRadius.circular(6),
+      border: Border.all(color: colors.accent.withValues(alpha: 0.4)),
+    ),
+    child: Text(
+      l10n.homeSupporter,
+      style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 8, fontWeight: FontWeight.w500, color: colors.accent, letterSpacing: 0.12),
+    ),
+  );
+}
+
+Widget _verifiedTick({required bool onAmber}) {
+  final ring = onAmber ? colors.accent : colors.surface;
+  final fill = onAmber ? colors.accentOn : colors.accent;
+  final glyph = onAmber ? colors.accent : colors.surface;
+  return Container(
+    width: 14,
+    height: 14,
+    decoration: BoxDecoration(
+      shape: BoxShape.circle,
+      color: fill,
+      border: Border.all(color: ring, width: 1.5),
+    ),
+    alignment: Alignment.center,
+    child: Icon(Icons.check, size: 8, color: glyph),
+  );
+}
+
+class _SwipeRow extends StatelessWidget {
+  final ContactPreview c;
+  final VoidCallback onTap;
+  const _SwipeRow({required this.c, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return Dismissible(
+      key: ValueKey('swipe_${c.haloId}'),
+      background: Container(
+        color: colors.surfaceElevated,
+        alignment: AlignmentDirectional.centerStart,
+        padding: const EdgeInsetsDirectional.only(start: 24),
+        child: Icon(
+          c.muted
+              ? Icons.notifications_active_outlined
+              : Icons.notifications_off_outlined,
+          size: 20,
+          color: colors.textSecondary,
+        ),
+      ),
+      secondaryBackground: Container(
+        color: colors.surfaceElevated,
+        alignment: AlignmentDirectional.centerEnd,
+        padding: const EdgeInsetsDirectional.only(end: 24),
+        child: Semantics(
+          label: l10n.homeArchivedChats,
+          button: true,
+          child: Icon(
+            Icons.archive_outlined,
+            size: 20,
+            color: colors.accent,
+          ),
+        ),
+      ),
+      confirmDismiss: (dir) async {
+        if (dir == DismissDirection.endToStart) {
+          await appState.archive(c.haloId);
+        } else if (c.muted) {
+          await appState.unmute(c.haloId);
+        } else {
+          await appState.mute(c.haloId);
+        }
+        return false;
+      },
+      child: _Row(c: c, onTap: onTap, onLongPress: () => _chatMenu(context, c)),
+    );
+  }
+}
+
+void _chatMenu(BuildContext context, ContactPreview c) {
+  HapticFeedback.mediumImpact();
+  showHaloSheet<void>(
+    context,
+    builder: (sheetCtx) => SafeArea(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SheetHandle(),
+          const SizedBox(height: 14),
+          ListTile(
+            leading: Icon(
+              c.muted
+                  ? Icons.notifications_active_outlined
+                  : Icons.notifications_off_outlined,
+              color: colors.textSecondary,
+              size: 22,
+            ),
+            title: Text(
+              c.muted ? l10n.homeUnmute : l10n.homeMute,
+              style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 15, fontWeight: FontWeight.w400, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+            ),
+            onTap: () {
+              Navigator.pop(sheetCtx);
+              c.muted ? appState.unmute(c.haloId) : appState.mute(c.haloId);
+            },
+          ),
+          ListTile(
+            leading: Icon(
+              Icons.archive_outlined,
+              color: colors.accent,
+              size: 22,
+            ),
+            title: Text(
+              l10n.homeArchive,
+              style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 15, fontWeight: FontWeight.w400, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+            ),
+            onTap: () {
+              Navigator.pop(sheetCtx);
+              appState.archive(c.haloId);
+            },
+          ),
+          ListTile(
+            leading: Icon(
+              Icons.delete_outline_rounded,
+              color: colors.error,
+              size: 22,
+            ),
+            title: Text(
+              l10n.homeDeleteChat,
+              style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 15, fontWeight: FontWeight.w400, color: colors.error, height: 1.5, letterSpacing: 0),
+            ),
+            subtitle: Text(
+              l10n.homeMessagesAndContactGone,
+              style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.12),
+            ),
+            onTap: () {
+              Navigator.pop(sheetCtx);
+              _confirmDelete(context, c);
+            },
+          ),
+          const SizedBox(height: 8),
+        ],
+      ),
+    ),
+  );
+}
+
+Future<void> _confirmDelete(BuildContext context, ContactPreview c) async {
+  final ok = await showConfirmSheet(
+    context,
+    title: l10n.homeDeleteThisChat,
+    line: l10n.homeEveryMessageWithGoes(c.nickname ?? c.haloId),
+    yes: l10n.commonDelete,
+  );
+  if (!ok) return;
+  HapticFeedback.heavyImpact();
+  await appState.deleteConversation(c.haloId);
+}
+
+class _Row extends StatelessWidget {
+  final ContactPreview c;
+  final VoidCallback onTap;
+  final VoidCallback? onLongPress;
+  const _Row({required this.c, required this.onTap, this.onLongPress});
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return InkWell(
+      onTap: onTap,
+      onLongPress: onLongPress,
+      splashColor: colors.accent.withValues(alpha: 0.10),
+      highlightColor: colors.accent.withValues(alpha: 0.05),
+      // Ink, not Container: an unread row tints itself amber, and a Container
+      // paints that tint over the splash so the tap looks dead.
+      child: Ink(
+        decoration: c.unread > 0
+            ? BoxDecoration(
+                color: colors.accent.withValues(alpha: 0.06),
+                border: BorderDirectional(
+                  start: BorderSide(color: colors.accent, width: 2),
+                ),
+              )
+            : null,
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 11),
+        child: Row(
+          children: [
+            Opacity(
+              opacity: c.blocked ? 0.4 : 1,
+              child: Stack(
+                clipBehavior: Clip.none,
+                children: [
+                  Hero(
+                    tag: 'face-${c.avatarSeed}',
+                    child: KryfoAvatar(
+                      seed: c.avatarSeed,
+                      size: 44,
+                      choice: c.avatar,
+                    ),
+                  ),
+                  if (c.verified)
+                    PositionedDirectional(
+                      end: -1,
+                      bottom: -1,
+                      child: _verifiedTick(onAmber: false),
+                    ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Flexible(
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Flexible(
+                              child: Text(
+                                c.nickname ?? c.haloId,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: c.unread > 0
+                                      ? FontWeight.w600
+                                      : FontWeight.w500, color: c.blocked
+                                      ? colors.textTertiary
+                                      : colors.textPrimary, height: 1.5, letterSpacing: 0),
+                              ),
+                            ),
+                            if (c.supporterBadge != null) ...[
+                              const SizedBox(width: 6),
+                              _supporterPill(),
+                            ],
+                          ],
+                        ),
+                      ),
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (c.pinned) ...[
+                            Icon(
+                              Icons.push_pin,
+                              size: 11,
+                              color: colors.textTertiary,
+                            ),
+                            const SizedBox(width: 4),
+                          ],
+                          if (c.muted) ...[
+                            Icon(
+                              Icons.notifications_off_outlined,
+                              size: 12,
+                              color: colors.textTertiary,
+                            ),
+                            const SizedBox(width: 4),
+                          ],
+                          // a message still in the outbox says so where the
+                          // time would be, so the row is honest about it
+                          if (!c.blocked &&
+                              appState.queuedFor(c.haloId) > 0 &&
+                              (!appState.online || !appState.torReady))
+                            Text(
+                              l10n.homeQueued,
+                              style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: colors.textSecondary, letterSpacing: 0.08),
+                            )
+                          else
+                            Text(
+                              (c.blocked ? l10n.homeBlocked : _relTime(c.when)),
+                              style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 11.5, fontWeight: FontWeight.w400, color: c.unread > 0
+                                    ? colors.accent
+                                    : colors.textTertiary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+                            ),
+                        ],
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 2),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          // a room link is an invitation, not a line of
+                          // two hundred characters
+                          (c.preview ?? '').contains('kryfo://room?')
+                              ? l10n.homeRoomInvite
+                              : (c.preview ?? ''),
+                          style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 12, fontWeight: FontWeight.w400, color: c.unread > 0
+                                ? colors.textSecondary
+                                : colors.textSecondary, height: 1.5, letterSpacing: 0),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      if (c.unread > 0) ...[
+                        const SizedBox(width: 8),
+                        _UnreadBadge(c.unread),
+                      ],
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+String _relTime(DateTime? t) {
+  if (t == null) return '';
+  final d = DateTime.now().difference(t);
+  if (d.inMinutes < 1) return l10n.homeNow;
+  if (d.inMinutes < 60) return l10n.homeM(whole(d.inMinutes));
+  if (d.inHours < 24) return l10n.homeH(whole(d.inHours));
+  if (d.inDays == 1) return l10n.homeYesterday;
+  if (d.inDays < 7) return l10n.homeD(whole(d.inDays));
+  // older than a week: a short date reads better than a big day count
+  return dayMonth(t);
+}
+
+// the two quiet places, side by side, so the chats start higher up
+class _QuickTiles extends StatelessWidget {
+  final VoidCallback onNotes;
+  final VoidCallback onSaved;
+  const _QuickTiles({required this.onNotes, required this.onSaved});
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    // the two tiles keep one height when one subtitle wraps and the other
+    // does not
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+      child: IntrinsicHeight(
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Expanded(
+              child: _QuickTile(
+                icon: Icons.edit_note_rounded,
+                title: l10n.homeNoteToSelf,
+                line: l10n.homeOnlyOnThisPhone,
+                onTap: onNotes,
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: _QuickTile(
+                icon: Icons.bookmark,
+                title: l10n.homeSaved,
+                line: l10n.homeKeptFromEveryChat,
+                onTap: onSaved,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _QuickTile extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String line;
+  final VoidCallback onTap;
+  const _QuickTile({
+    required this.icon,
+    required this.title,
+    required this.line,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return PressScale(
+      label: title,
+      onTap: onTap,
+      scale: 0.97,
+      child: Container(
+        padding: const EdgeInsetsDirectional.fromSTEB(12, 11, 10, 11),
+        decoration: BoxDecoration(
+          color: colors.surfaceElevated,
+          borderRadius: BorderRadius.circular(UmbraRadius.lg),
+          border: Border.all(color: colors.separator, width: 0.5),
+        ),
+        child: Row(
+          children: [
+            Container(
+              width: 28,
+              height: 28,
+              decoration: BoxDecoration(
+                color: colors.accentSoft,
+                borderRadius: BorderRadius.circular(UmbraRadius.md),
+              ),
+              alignment: Alignment.center,
+              child: Icon(icon, color: colors.accent, size: 16),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // the whole title, shrunk if it has to be, never cut off
+                  // at a big font size
+                  FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: AlignmentDirectional.centerStart,
+                    child: Text(
+                      title,
+                      maxLines: 1,
+                      style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 14, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+                    ),
+                  ),
+                  const SizedBox(height: 1),
+                  Text(
+                    line,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 10.5, fontWeight: FontWeight.w400, color: colors.textTertiary, height: 1.5, letterSpacing: 0),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// unknown-sender requests. amber, shows a count, only rendered when > 0.
+class _RequestsPin extends StatelessWidget {
+  final int count;
+  final VoidCallback onTap;
+  const _RequestsPin({required this.count, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return GestureDetector(
+      onTap: onTap,
+      behavior: HitTestBehavior.opaque,
+      child: Container(
+        margin: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        decoration: BoxDecoration(
+          color: colors.surfaceElevated,
+          borderRadius: BorderRadius.circular(UmbraRadius.lg),
+          border: Border.all(
+            color: colors.accent.withValues(alpha: 0.35),
+            width: 0.8,
+          ),
+        ),
+        child: Row(
+          children: [
+            Container(
+              width: 32,
+              height: 32,
+              decoration: BoxDecoration(
+                color: colors.accentSoft,
+                borderRadius: BorderRadius.circular(UmbraRadius.md),
+              ),
+              alignment: Alignment.center,
+              child: Icon(
+                Icons.mail_outline,
+                color: colors.accent,
+                size: 18,
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    l10n.homeRequests,
+                    style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 14, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+                  ),
+                  const SizedBox(height: 1),
+                  Text(
+                    l10n.home1PersonWantsTo(count),
+                    style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 11, fontWeight: FontWeight.w400, color: colors.textTertiary, height: 1.5, letterSpacing: 0),
+                  ),
+                ],
+              ),
+            ),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                color: colors.accent,
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Text(
+                '$count',
+                style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 12, fontWeight: FontWeight.w700, color: colors.accentOn, height: 1.5, letterSpacing: 0),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}

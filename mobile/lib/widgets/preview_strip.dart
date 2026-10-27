@@ -1,0 +1,137 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+import 'package:flutter/material.dart';
+
+import '../link_preview.dart' show domainOf;
+import '../theme/theme.dart';
+import 'press_scale.dart';
+import '../l10n/l10n.dart';
+
+// the sender's consent, above the composer: a link in the text offers
+// "add preview"; tapping it fetches the page title over tor on this phone
+// and shows what will ride inside the message. nothing happens on its own.
+class PreviewStrip extends StatelessWidget {
+  final String? url;
+  final Map<String, String>? pending;
+  final bool busy;
+  final VoidCallback onAdd;
+  final VoidCallback onDrop;
+  const PreviewStrip({
+    super.key,
+    required this.url,
+    required this.pending,
+    required this.busy,
+    required this.onAdd,
+    required this.onDrop,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+  final colors = UmbraTheme.colorsOf(context);
+
+    final p = pending;
+    final show = p != null || url != null;
+    return AnimatedSize(
+      duration: const Duration(milliseconds: 220),
+      curve: UmbraMotion.easeOut,
+      alignment: Alignment.bottomCenter,
+      child: !show
+          ? const SizedBox(width: double.infinity)
+          : Padding(
+              padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
+              child: p != null
+                  ? Container(
+                      padding: const EdgeInsetsDirectional.fromSTEB(
+                        12,
+                        8,
+                        6,
+                        8,
+                      ),
+                      decoration: BoxDecoration(
+                        color: colors.surfaceElevated,
+                        borderRadius: BorderRadius.circular(UmbraRadius.lg),
+                        border: Border.all(color: colors.separator, width: 0.5),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(Icons.link, size: 14, color: colors.accent),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  p['title'] ?? '',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 12.5, fontWeight: FontWeight.w600, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+                                ),
+                                Text(
+                                  l10n.previewStripFetchedOverTor(
+                                    domainOf(p['url'] ?? ''),
+                                  ),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 9.5, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.12),
+                                ),
+                              ],
+                            ),
+                          ),
+                          PressScale(
+                            label: l10n.previewStripDropThePreview,
+                            onTap: onDrop,
+                            child: Padding(
+                              padding: const EdgeInsets.all(6),
+                              child: Icon(
+                                Icons.close_rounded,
+                                size: 16,
+                                color: colors.textSecondary,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    )
+                  : Align(
+                      alignment: AlignmentDirectional.centerStart,
+                      child: PressScale(
+                        label: l10n.previewStripAddPreview,
+                        onTap: busy ? null : onAdd,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 7,
+                          ),
+                          decoration: BoxDecoration(
+                            color: colors.accentSoft,
+                            borderRadius: BorderRadius.circular(999),
+                            border: Border.all(
+                              color: colors.accent.withValues(alpha: 0.35),
+                              width: 0.5,
+                            ),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                busy ? Icons.hourglass_top_rounded : Icons.link,
+                                size: 13,
+                                color: colors.accent,
+                              ),
+                              const SizedBox(width: 6),
+                              Text(
+                                busy
+                                    ? l10n.previewStripFetchingOverTor
+                                    : l10n.previewStripAddPreview,
+                                style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10.5, fontWeight: FontWeight.w600, color: colors.accent, letterSpacing: 0.12),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+            ),
+    );
+  }
+}

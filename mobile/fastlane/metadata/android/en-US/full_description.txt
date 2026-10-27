@@ -1,0 +1,24 @@
+a private messenger. no phone number, no email, no account. you are a key
+pair generated on your device. nobody, including us, can look you up or tie
+your chats to a real identity.
+
+everything travels over tor. content is end to end encrypted with the signal
+protocol. when a contact is offline, messages wait on relays, sealed so the
+relay learns nothing about who is talking or what is said. no address book
+upload, ever.
+
+features:
+
+* no phone number or email to sign up
+* end to end encryption (signal protocol)
+* all traffic through an embedded tor client
+* direct onion delivery, relay fallback when a peer is offline
+* groups with photos, files, voice messages, replies, reactions, pins
+* timed messages that burn after a set time
+* encrypted local database and encrypted backups
+* app lock with pin or biometrics
+* panic wipe that removes everything, including media on disk
+* no analytics, no telemetry, no ads
+
+funding: no ads, no investors. it runs on what backers give. backing is
+optional and anonymous, and every feature works the same either way.

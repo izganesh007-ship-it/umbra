@@ -1,0 +1,78 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+import 'package:intl/date_symbol_data_local.dart';
+import 'package:intl/intl.dart';
+
+// every date and time kryfo shows, in the chosen language's own order and
+// words. skeletons, not patterns, so the order is the language's. "today"
+// and relative times stay messages in the arb. english is british.
+
+String _chosen = 'en_GB';
+bool _ready = false;
+
+// the data for every locale ships with intl; this only indexes it, once,
+// and synchronously despite the future it returns
+String get _locale {
+  if (!_ready) {
+    initializeDateFormatting();
+    _ready = true;
+  }
+  return _chosen;
+}
+
+/// the intl locale dates and numbers are formatted in. set with the app's
+/// language.
+String get intlLocale => _locale;
+
+void setDateLocale(String intlLocale) => _chosen = intlLocale;
+
+/// intl's name for a language's date and number data. english is british,
+/// portuguese is brazil's (intl's plain "pt"), chinese by script.
+String intlLocaleFor(String languageCode, {String? scriptCode}) {
+  if (languageCode == 'en') return 'en_GB';
+  if (languageCode == 'zh') return scriptCode == 'Hant' ? 'zh_TW' : 'zh';
+  // arabic writes arabic-indic digits. intl's plain "ar" gives them only to
+  // dates; its egyptian data gives them to numbers too, same month names.
+  if (languageCode == 'ar') return 'ar_EG';
+  return languageCode;
+}
+
+/// "23 Sep"
+String dayMonth(DateTime d) => DateFormat.MMMd(_locale).format(d);
+
+/// a date for the small capital labels ("23 SEPT"). dart's toUpperCase
+/// knows no language, and turkish and azerbaijani keep the dot on a capital i.
+String dateCaps(String s) {
+  final lang = _chosen.split('_').first;
+  if (lang == 'tr' || lang == 'az') s = s.replaceAll('i', 'İ');
+  return s.toUpperCase();
+}
+
+/// "23 Sep 2025"
+String dayMonthYear(DateTime d) => DateFormat.yMMMd(_locale).format(d);
+
+/// "23 Sep" this year, "23 Sep 2025" otherwise
+String dayMonthMaybeYear(DateTime d, {DateTime? now}) =>
+    d.year == (now ?? DateTime.now()).year ? dayMonth(d) : dayMonthYear(d);
+
+/// "23 September"
+String dayMonthLong(DateTime d) => DateFormat.MMMMd(_locale).format(d);
+
+/// "Wednesday"
+String weekday(DateTime d) => DateFormat.EEEE(_locale).format(d);
+
+/// "Wed"
+String weekdayShort(DateTime d) => DateFormat.E(_locale).format(d);
+
+/// "15:19", 24-hour everywhere
+String hourMinute(DateTime d) => DateFormat.Hm(_locale).format(d);
+
+/// "Wednesday 23 September 2026" (with the time: see [longDateTime])
+String longDate(DateTime d) => DateFormat.yMMMMEEEEd(_locale).format(d);
+
+/// "Wednesday 23 September 2026 15:19"
+String longDateTime(DateTime d) =>
+    DateFormat.yMMMMEEEEd(_locale).add_Hm().format(d);
+
+/// "23 Sep 2026 15:19:07"
+String mediumDateTime(DateTime d) =>
+    DateFormat.yMMMd(_locale).add_Hms().format(d);

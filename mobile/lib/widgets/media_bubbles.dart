@@ -1,0 +1,817 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// media widgets shared with the group chat: voice, file and photo.
+// todo: chat_screen still has its own file card, fold it in here.
+
+import 'dart:async';
+import 'dart:io';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:just_audio/just_audio.dart';
+import 'package:record/record.dart';
+import 'package:path_provider/path_provider.dart';
+
+import '../main.dart' show shredFile;
+import '../theme/theme.dart';
+import 'decode_px.dart';
+import '../l10n/l10n.dart';
+import '../l10n/numbers.dart';
+import '../lock_guard.dart' show lockGuard;
+
+String _humanSize(int bytes) {
+  if (bytes < 1024) return l10n.mediaBubblesB(whole(bytes));
+  if (bytes < 1024 * 1024) {
+    return l10n.mediaBubblesKb(whole(((bytes / 1024)).round()));
+  }
+  return l10n.mediaBubblesMb(decimal((bytes / (1024 * 1024)), 1));
+}
+
+IconData _fileGlyph(String name) {
+  final n = name.toLowerCase();
+  if (n.endsWith('.pdf')) return Icons.picture_as_pdf_outlined;
+  if (n.endsWith('.zip') || n.endsWith('.rar') || n.endsWith('.7z')) {
+    return Icons.folder_zip_outlined;
+  }
+  if (n.endsWith('.doc') || n.endsWith('.docx') || n.endsWith('.txt')) {
+    return Icons.description_outlined;
+  }
+  if (n.endsWith('.mp3') || n.endsWith('.wav') || n.endsWith('.m4a')) {
+    return Icons.audiotrack_outlined;
+  }
+  if (n.endsWith('.mp4') || n.endsWith('.mov') || n.endsWith('.mkv')) {
+    return Icons.movie_outlined;
+  }
+  return Icons.insert_drive_file_outlined;
+}
+
+// a picture sent through the file picker arrives as a file. if the name says
+// it is an image, show it as one with the name underneath. a name that lies
+// is caught by the decode: errorBuilder falls back to the plain card.
+const _imageExts = {
+  '.jpg',
+  '.jpeg',
+  '.png',
+  '.gif',
+  '.webp',
+  '.bmp',
+  '.heic',
+  '.heif',
+};
+
+bool _nameSaysImage(String? name) {
+  final n = (name ?? '').toLowerCase();
+  return _imageExts.any(n.endsWith);
+}
+
+Widget fileCard(String? filePath, String? fileName, bool isOut) {
+  if (filePath != null && _nameSaysImage(fileName)) {
+    final fallback = _plainFileCard(filePath, fileName, isOut);
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 230),
+      child: Image.file(
+        File(filePath),
+        fit: BoxFit.cover,
+        cacheWidth: 460,
+        filterQuality: FilterQuality.low,
+        errorBuilder: (_, _, _) => fallback,
+        // wraps only an image that is actually loading, so the caption
+        // cannot end up under a card that replaced it
+        frameBuilder: (ctx, child, frame, wasSync) => Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            ClipRRect(borderRadius: BorderRadius.circular(UmbraRadius.lg), child: child),
+            const SizedBox(height: 4),
+            Text(
+              fileName ?? 'file',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 9, fontWeight: FontWeight.w500, color: isOut ? colors.accentOn : colors.textTertiary, letterSpacing: 0.12),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+  return _plainFileCard(filePath, fileName, isOut);
+}
+
+Widget _plainFileCard(String? filePath, String? fileName, bool isOut) {
+  final fg = isOut ? colors.accentOn : colors.textPrimary;
+  final sub = isOut ? colors.accentOn : colors.textTertiary;
+  final icon = isOut ? colors.accentOn : colors.accent;
+  int? sz;
+  try {
+    if (filePath != null) sz = File(filePath).lengthSync();
+  } catch (_) {}
+  final ext = (fileName ?? '').contains('.')
+      ? fileName!.split('.').last.toUpperCase()
+      : l10n.mediaBubblesFile;
+  return Container(
+    constraints: const BoxConstraints(maxWidth: 230),
+    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+    decoration: BoxDecoration(
+      color: isOut
+          ? colors.accentOn.withValues(alpha: 0.12)
+          : colors.surfaceHover,
+      borderRadius: BorderRadius.circular(UmbraRadius.lg),
+    ),
+    child: Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 38,
+          height: 38,
+          decoration: BoxDecoration(
+            color: isOut
+                ? colors.accentOn.withValues(alpha: 0.16)
+                : colors.accentSoft,
+            borderRadius: BorderRadius.circular(9),
+          ),
+          child: Icon(_fileGlyph(fileName ?? ''), size: 19, color: icon),
+        ),
+        const SizedBox(width: 10),
+        Flexible(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                fileName ?? 'file',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w500, color: fg, height: 1.5, letterSpacing: 0),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                sz != null ? '$ext · ${_humanSize(sz)}' : ext,
+                style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 9, fontWeight: FontWeight.w500, color: sub, letterSpacing: 0.12),
+              ),
+            ],
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+void openFullImage(BuildContext context, String path) {
+  // drop composer focus first, else popping the viewer restores it and the
+  // keyboard springs up over the chat.
+  FocusManager.instance.primaryFocus?.unfocus();
+  Navigator.of(context).push(
+    MaterialPageRoute(
+      fullscreenDialog: true,
+      builder: (ctx) => GestureDetector(
+        onTap: () => Navigator.of(ctx).pop(),
+        child: Scaffold(
+          backgroundColor: Colors.black,
+          body: SafeArea(
+            child: Center(
+              child: InteractiveViewer(
+                minScale: 1,
+                maxScale: 4,
+                // twice the screen: enough for the zoom, a fraction of
+                // the file
+                child: Image.file(
+                  File(path),
+                  cacheWidth: screenPx(ctx, times: 2),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+class VoiceBubble extends StatefulWidget {
+  final String path;
+  final bool isOut;
+  final bool disguised;
+  const VoiceBubble({
+    super.key,
+    required this.path,
+    required this.isOut,
+    this.disguised = false,
+  });
+  @override
+  State<VoiceBubble> createState() => VoiceBubbleState();
+}
+
+class VoiceBubbleState extends State<VoiceBubble> {
+  final _player = AudioPlayer();
+  bool _ready = false;
+  bool _missing = false;
+  bool _playing = false;
+  Duration _dur = Duration.zero;
+  Duration _pos = Duration.zero;
+
+  @override
+  void initState() {
+    super.initState();
+    // no _load() here: it takes a native media handle per bubble, and a chat
+    // with several voice notes exhausts android's codec pool. the real load
+    // waits for the first tap in _toggle.
+    _checkExists();
+    _player.playerStateStream.listen((st) {
+      if (!mounted) return;
+      setState(() => _playing = st.playing);
+      // android takes the codec back when it wants it, and other audio can
+      // stop us too. a lost source has to be loaded again, and _toggle puts
+      // the position back.
+      if (st.processingState == ProcessingState.idle) {
+        _ready = false;
+      }
+      if (st.processingState == ProcessingState.completed) {
+        _player.seek(Duration.zero);
+        _player.pause();
+        if (mounted) {
+          setState(() {
+            _playing = false;
+            _pos = Duration.zero;
+          });
+        }
+      }
+    });
+    // rebuild on position ticks only while playing: idle bubbles rebuilding
+    // every tick cost scroll frames
+    _player.positionStream.listen((p) {
+      if (mounted && _playing) setState(() => _pos = p);
+    });
+  }
+
+  // flag missing files, and read the clip length once per file with a
+  // throwaway player, disposed right after so no bubble holds a codec handle
+  static final Map<String, Duration> _durCache = {};
+
+  Future<void> _checkExists() async {
+    if (!await File(widget.path).exists()) {
+      if (mounted) setState(() => _missing = true);
+      return;
+    }
+    final cached = _durCache[widget.path];
+    if (cached != null) {
+      if (mounted) setState(() => _dur = cached);
+      return;
+    }
+    // probe just once, off the first frame so it never blocks chat-open layout.
+    Future.delayed(const UmbraMotion.durationSlow, () async {
+      if (!mounted) return;
+      final probe = AudioPlayer();
+      try {
+        final d = await probe.setFilePath(widget.path);
+        if (d != null) {
+          _durCache[widget.path] = d;
+          if (mounted) setState(() => _dur = d);
+        }
+      } catch (_) {
+      } finally {
+        await probe.dispose();
+      }
+    });
+  }
+
+  Future<void> _load() async {
+    // an old note can point at a file that is gone: show 'audio unavailable'
+    if (!await File(widget.path).exists()) {
+      if (mounted) setState(() => _missing = true);
+      return;
+    }
+    // setFilePath can fail when the player's native resources were recycled
+    // or a just-recorded note is not flushed yet, so it gets a few tries
+    for (var attempt = 0; attempt < 3; attempt++) {
+      try {
+        _dur = await _player.setFilePath(widget.path) ?? Duration.zero;
+        if (mounted) setState(() => _ready = true);
+        return;
+      } catch (_) {
+        await Future.delayed(const UmbraMotion.durationNormal);
+      }
+    }
+  }
+
+  // the lock pauses a note that is playing
+  VoidCallback? _unguard;
+
+  @override
+  void dispose() {
+    _unguard?.call();
+    _player.dispose();
+    super.dispose();
+  }
+
+  void _toggle() async {
+    if (!_ready) {
+      // where it was before the player lost its source, so a reload
+      // carries on instead of starting over
+      final was = _pos;
+      await _load();
+      if (!_ready) return;
+      if (was > Duration.zero && was < _dur) {
+        await _player.seek(was);
+      }
+    }
+    if (_playing) {
+      _unguard?.call();
+      _unguard = null;
+      _player.pause();
+    } else {
+      // the lock went up while the note was loading
+      if (lockGuard.isLocked()) return;
+      _unguard ??= lockGuard.closeOnLock(() {
+        _unguard = null;
+        // stop, not pause: a note a call paused would start again by
+        // itself when the call ends. the next tap carries on from here
+        _player.stop();
+      });
+      _player.play();
+    }
+  }
+
+  String _fmt(Duration d) {
+    final s = d.inSeconds;
+    return '${whole(s ~/ 60)}:${twoDigits(s % 60)}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+  final colors = UmbraTheme.colorsOf(context);
+
+    final fg = widget.isOut ? colors.accentOn : colors.accent;
+    final track = widget.isOut
+        ? colors.accentOn.withValues(alpha: 0.3)
+        : colors.textTertiary.withValues(alpha: 0.4);
+    final progress = (_dur.inMilliseconds == 0)
+        ? 0.0
+        : (_pos.inMilliseconds / _dur.inMilliseconds).clamp(0.0, 1.0);
+    final shown = _pos > Duration.zero ? _pos : _dur;
+    return GestureDetector(
+      onTap: _missing ? null : _toggle,
+      behavior: HitTestBehavior.opaque,
+      child: SizedBox(
+        width: 168,
+        child: _missing
+            ? Row(
+                children: [
+                  Icon(
+                    Icons.music_off_rounded,
+                    size: 20,
+                    color: fg.withValues(alpha: 0.5),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    l10n.mediaBubblesAudioUnavailable,
+                    style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11, fontWeight: FontWeight.w500, color: fg.withValues(alpha: 0.55, letterSpacing: 0.12),
+                    ),
+                  ),
+                ],
+              )
+            : Row(
+                children: [
+                  Icon(
+                    _playing ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                    size: 26,
+                    color: fg,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(2),
+                          child: LinearProgressIndicator(
+                            value: progress,
+                            minHeight: 3,
+                            backgroundColor: track,
+                            valueColor: AlwaysStoppedAnimation(fg),
+                          ),
+                        ),
+                        const SizedBox(height: 5),
+                        Row(
+                          children: [
+                            Text(
+                              _fmt(shown),
+                              style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: widget.isOut
+                                    ? colors.accentOn
+                                    : colors.textTertiary, letterSpacing: 0.12),
+                            ),
+                            if (widget.disguised) ...[
+                              const SizedBox(width: 8),
+                              Icon(
+                                Icons.theater_comedy_outlined,
+                                size: 11,
+                                color: widget.isOut
+                                    ? colors.accentOn
+                                    : colors.accent,
+                              ),
+                              const SizedBox(width: 3),
+                              Text(
+                                l10n.mediaBubblesHidden,
+                                style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 9, fontWeight: FontWeight.w500, color: widget.isOut
+                                      ? colors.accentOn
+                                      : colors.accent, letterSpacing: 0.12),
+                              ),
+                            ],
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+      ),
+    );
+  }
+}
+
+class HoldToTalkMic extends StatefulWidget {
+  final bool disguise;
+  final VoidCallback onToggleDisguise;
+  final void Function(String path, int ms, bool cancelled) onComplete;
+  const HoldToTalkMic({
+    super.key,
+    required this.disguise,
+    required this.onToggleDisguise,
+    required this.onComplete,
+  });
+  @override
+  State<HoldToTalkMic> createState() => HoldToTalkMicState();
+}
+
+class HoldToTalkMicState extends State<HoldToTalkMic> {
+  final _rec = AudioRecorder();
+  OverlayEntry? _overlay;
+  Timer? _ticker;
+  int _ms = 0;
+  bool _willCancel = false;
+  double _dragDx = 0;
+  bool _busy = false;
+  bool _live = false;
+  String? _path;
+  double _bottomInset = 0;
+
+  VoidCallback? _unguard;
+
+  @override
+  void dispose() {
+    _unguard?.call();
+    _ticker?.cancel();
+    _overlay?.remove();
+    _rec.dispose();
+    super.dispose();
+  }
+
+  Future<void> _start() async {
+    if (_busy) return;
+    _busy = true;
+    if (!await _rec.hasPermission()) {
+      _busy = false;
+      if (mounted) showHaloToast(context, l10n.mediaBubblesMicPermissionNeeded);
+      return;
+    }
+    // the permission prompt eats the long-press: by the time the user grants,
+    // the finger is gone and nothing would stop the recording. they hold
+    // again.
+    if (!_live) {
+      _busy = false;
+      return;
+    }
+    final dir = await getTemporaryDirectory();
+    final path = '${dir.path}/vn_${DateTime.now().millisecondsSinceEpoch}.wav';
+    await _rec.start(
+      const RecordConfig(
+        encoder: AudioEncoder.wav,
+        sampleRate: 16000,
+        numChannels: 1,
+      ),
+      path: path,
+    );
+    _path = path;
+    _ms = 0;
+    _willCancel = false;
+    _dragDx = 0;
+    HapticFeedback.mediumImpact();
+    _ticker = Timer.periodic(const UmbraMotion.durationFast, (_) {
+      _ms += 100;
+      _overlay?.markNeedsBuild();
+    });
+    if (mounted) _bottomInset = MediaQuery.of(context).padding.bottom;
+    _overlay = OverlayEntry(builder: (_) => _bar());
+    if (mounted) Overlay.of(context).insert(_overlay!);
+    // the lock stops the recording and throws it away
+    _unguard = lockGuard.closeOnLock(_abort);
+    _busy = false;
+  }
+
+  Future<void> _end() async {
+    _unguard?.call();
+    _unguard = null;
+    _ticker?.cancel();
+    _ticker = null;
+    _overlay?.remove();
+    _overlay = null;
+    final path = await _rec.stop();
+    final ms = _ms;
+    final cancel = _willCancel || ms < 400;
+    if (cancel) {
+      final p = path ?? _path;
+      if (p != null) {
+        // a cancelled note is still a recording of a voice: shredded
+        await shredFile(p);
+      }
+      HapticFeedback.lightImpact();
+      widget.onComplete('', 0, true);
+      return;
+    }
+    HapticFeedback.mediumImpact();
+    widget.onComplete(path ?? _path ?? '', ms, false);
+  }
+
+  // kill the recording from the bar itself - covers any state where the
+  // finger isn't down anymore but the mic is still going.
+  void _abort() {
+    _willCancel = true;
+    _end();
+  }
+
+  String get _time {
+    final s = _ms ~/ 1000;
+    final m = s ~/ 60;
+    return '${whole(m)}:${twoDigits(s % 60)}';
+  }
+
+  Widget _bar() {
+    final cancel = _willCancel;
+    // fade the slide hint out as the finger approaches the cancel threshold.
+    final slideProgress = (_dragDx / -90).clamp(0.0, 1.0);
+    return Positioned(
+      left: 0,
+      right: 0,
+      bottom: 0,
+      child: TweenAnimationBuilder<double>(
+        tween: Tween(begin: 0.0, end: 1.0),
+        duration: const Duration(milliseconds: 180),
+        curve: UmbraMotion.easeOut,
+        builder: (_, t, child) => Opacity(
+          opacity: t,
+          child: Transform.translate(
+            offset: Offset(0, (1 - t) * 44),
+            child: child,
+          ),
+        ),
+        child: Material(
+          color: Colors.transparent,
+          child: Container(
+            padding: EdgeInsets.fromLTRB(18, 16, 18, 16 + _bottomInset),
+            decoration: BoxDecoration(
+              color: colors.surface,
+              border: Border(
+                top: BorderSide(
+                  color: cancel ? colors.error : colors.separator,
+                  width: 0.8,
+                ),
+              ),
+            ),
+            child: Row(
+              children: [
+                // pulsing record dot
+                TweenAnimationBuilder<double>(
+                  key: const ValueKey('rec-dot'),
+                  tween: Tween(begin: 0.4, end: 1.0),
+                  duration: const Duration(milliseconds: 650),
+                  curve: Curves.easeInOut,
+                  builder: (_, v, _) => Opacity(
+                    opacity: cancel ? 1.0 : v,
+                    child: Container(
+                      width: 11,
+                      height: 11,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: colors.error,
+                      ),
+                    ),
+                  ),
+                  onEnd: () => _overlay?.markNeedsBuild(),
+                ),
+                const SizedBox(width: 12),
+                Text(
+                  _time,
+                  style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 14, fontWeight: FontWeight.w500, color: colors.textPrimary, letterSpacing: 0.12),
+                ),
+                Expanded(
+                  child: cancel
+                      ? Center(
+                          child: Text(
+                            l10n.mediaBubblesReleaseToCancel,
+                            style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 12, fontWeight: FontWeight.w500, color: colors.error, letterSpacing: 0.12),
+                          ),
+                        )
+                      : Transform.translate(
+                          offset: Offset(_dragDx * 0.5, 0),
+                          child: Opacity(
+                            opacity: (1 - slideProgress * 0.7),
+                            child: Row(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: widget.disguise
+                                  ? [
+                                      Icon(
+                                        Icons.theater_comedy_outlined,
+                                        size: 14,
+                                        color: colors.accent,
+                                      ),
+                                      const SizedBox(width: 6),
+                                      Text(
+                                        l10n.mediaBubblesVoiceHiddenSlideTo,
+                                        style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11, fontWeight: FontWeight.w500, color: colors.accent, letterSpacing: 0.12),
+                                      ),
+                                    ]
+                                  : [
+                                      Icon(
+                                        Icons.chevron_left,
+                                        size: 16,
+                                        color: colors.textTertiary,
+                                      ),
+                                      Text(
+                                        l10n.mediaBubblesSlideToCancel,
+                                        style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 11, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.12),
+                                      ),
+                                    ],
+                            ),
+                          ),
+                        ),
+                ),
+                Semantics(
+                  label: l10n.commonClose,
+                  button: true,
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: _abort,
+                    child: Padding(
+                      padding: const EdgeInsetsDirectional.only(start: 8),
+                      child: Icon(
+                        Icons.close_rounded,
+                        size: 20,
+                        color: colors.textSecondary,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onLongPressStart: (_) {
+        _live = true;
+        _start();
+      },
+      onLongPressMoveUpdate: (d) {
+        _dragDx = d.offsetFromOrigin.dx.clamp(-160.0, 0.0);
+        final wc = d.offsetFromOrigin.dx < -90;
+        if (wc != _willCancel) {
+          _willCancel = wc;
+          if (wc) HapticFeedback.mediumImpact();
+        }
+        _overlay?.markNeedsBuild();
+      },
+      onLongPressEnd: (_) {
+        _live = false;
+        _end();
+      },
+      child: Icon(Icons.mic_none_rounded, size: 22, color: colors.textSecondary),
+    );
+  }
+}
+
+class ImageCaptionScreen extends StatefulWidget {
+  final Uint8List bytes;
+  const ImageCaptionScreen({super.key, required this.bytes});
+  @override
+  State<ImageCaptionScreen> createState() => ImageCaptionScreenState();
+}
+
+class ImageCaptionScreenState extends State<ImageCaptionScreen> {
+  final _ctrl = TextEditingController();
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return Scaffold(
+      backgroundColor: colors.surface,
+      body: SafeArea(
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsetsDirectional.fromSTEB(4, 4, 16, 4),
+              child: Row(
+                children: [
+                  IconButton(
+                    tooltip: l10n.commonBack,
+                    icon: Icon(Icons.arrow_back, color: colors.textSecondary),
+                    onPressed: () => Navigator.of(context).pop(),
+                  ),
+                  Text(
+                    l10n.mediaBubblesSendPhoto,
+                    style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 16, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+                  ),
+                ],
+              ),
+            ),
+            Expanded(
+              child: Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(14),
+                    child: Image.memory(
+                      widget.bytes,
+                      fit: BoxFit.contain,
+                      cacheWidth: screenPx(context),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _ctrl,
+                      autofocus: true,
+                      style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w400, height: 1.5, letterSpacing: 0),
+                      minLines: 1,
+                      maxLines: 4,
+                      decoration: InputDecoration(
+                        hintText: l10n.mediaBubblesAddACaption,
+                        hintStyle: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w400, color: colors.textTertiary, height: 1.5, letterSpacing: 0),
+                        isDense: true,
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 10,
+                        ),
+                        filled: true,
+                        fillColor: colors.surfaceElevated,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(UmbraRadius.radius2xl),
+                          borderSide: BorderSide.none,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Semantics(
+                    label: l10n.commonSend,
+                    button: true,
+                    child: GestureDetector(
+                      onTap: () {
+                        HapticFeedback.lightImpact();
+                        Navigator.of(context).pop(_ctrl.text.trim());
+                      },
+                      child: Container(
+                        width: 44,
+                        height: 44,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: colors.accent,
+                        ),
+                        alignment: Alignment.center,
+                        child: Icon(
+                          Icons.arrow_upward,
+                          size: 20,
+                          color: colors.accentOn,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}

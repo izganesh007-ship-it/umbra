@@ -1,0 +1,41 @@
+# the engine on its own, with no network: go + ndk come from local files in
+# dl/ instead of the download. run ./prep-offline.sh once to fetch, repack
+# and fill the hashes below. this checks libhalo.so only; the whole-apk
+# check is Dockerfile + verify.sh, which needs the network for gradle and
+# pub. the pins here must equal the ones in Dockerfile, or the two images
+# build different engines: go 1.25.14 is what the shipped engine says.
+FROM debian:bookworm-20250630-slim
+
+ENV GO_VERSION=1.25.14
+ENV GO_SHA256=2852af0cb20a13139b3448992e69b868e50ed0f8a1e5940ee1de9e19a123b613
+ENV NDK_VERSION=r28b
+ENV NDK_TGZ_SHA256=58c7fdf41a4b9177e0fcbe3fbb2f5ab1bb0d85ba26f35028c5a86fabbe2785f6
+
+# go toolchain from local tarball, checksum-verified
+COPY dl/go${GO_VERSION}.linux-amd64.tar.gz /tmp/go.tgz
+RUN echo "${GO_SHA256}  /tmp/go.tgz" | sha256sum -c - \
+    && tar -C /usr/local -xzf /tmp/go.tgz \
+    && rm /tmp/go.tgz
+ENV PATH=/usr/local/go/bin:$PATH
+
+# ndk repacked as tgz on the host (slim image has no unzip, and installing
+# one would need apt = network). hash is of the repack; the original zip's
+# sha1 got checked against google's published value in prep-offline.sh.
+COPY dl/android-ndk-${NDK_VERSION}.tgz /tmp/ndk.tgz
+RUN echo "${NDK_TGZ_SHA256}  /tmp/ndk.tgz" | sha256sum -c - \
+    && tar -C /opt -xzf /tmp/ndk.tgz \
+    && rm /tmp/ndk.tgz
+ENV NDK=/opt/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin
+
+WORKDIR /build
+
+ENV CGO_ENABLED=1
+ENV GOFLAGS=-trimpath
+ENV SOURCE_DATE_EPOCH=1700000000
+# modules come from the mounted cache, never the net
+ENV GOPROXY=off
+ENV GOMODCACHE=/gomod
+
+COPY engine-only.sh /usr/local/bin/engine-only.sh
+RUN chmod +x /usr/local/bin/engine-only.sh
+ENTRYPOINT ["/usr/local/bin/engine-only.sh"]

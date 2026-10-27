@@ -1,0 +1,242 @@
+﻿import 'package:flutter_test/flutter_test.dart';
+import 'package:umbra/scam_shield.dart';
+
+// each rule once firing and once quiet: a false alarm on a friend is the
+// fastest way to get the shield switched off
+
+List<String> _codes(ShieldResult r) => r.hits.map((h) => h.code).toList();
+
+void main() {
+  _groupTests();
+  group('normalise', () {
+    test('folds case, accents, homoglyphs and whitespace', () {
+      expect(normaliseName('  Alice   MÃ¼ller '), 'alice muller');
+      // cyrillic a, e, o, p, c, x
+      expect(normaliseName('Ð°lÑ–cÐµ'), 'alice');
+      expect(normaliseName('b0b 1ee'), 'bob lee');
+      expect(normaliseName('Ð¡Ð°Ð Ð'), 'capa');
+    });
+  });
+
+  group('impersonation', () {
+    const contacts = [
+      ShieldContact('thumb-behave-boring', nickname: 'alice', avatar: 7),
+      ShieldContact('candle-rope-sunday', nickname: null, avatar: 3),
+    ];
+
+    test('a homoglyph id flags with the contact named', () {
+      final r = checkImpersonation('thumb-bÐµhave-boring', null, contacts);
+      expect(r.flagged, true);
+      expect(r.headline, 'This name matches alice');
+      expect(_codes(r), ['name_match']);
+    });
+
+    test('one edit away flags, two do not', () {
+      expect(
+        checkImpersonation('thumb-behave-borins', null, contacts).flagged,
+        true,
+      );
+      expect(
+        checkImpersonation('thumb-behave-borixx', null, contacts).flagged,
+        false,
+      );
+    });
+
+    test('an id that reads as a nickname flags', () {
+      final r = checkImpersonation('Alice', null, contacts);
+      expect(r.flagged, true);
+      expect(r.hits.first.line, 'Name matches your contact alice');
+    });
+
+    test('a matching face only adds to near matches', () {
+      final r = checkImpersonation('thumb-behave-borins', 7, contacts);
+      expect(_codes(r), ['name_match', 'face_match']);
+      expect(
+        checkImpersonation('river-stone-moon', 7, contacts).flagged,
+        false,
+      );
+    });
+
+    test('the contact itself is not flagged', () {
+      expect(
+        checkImpersonation('thumb-behave-boring', 7, contacts).flagged,
+        false,
+      );
+    });
+
+    test('a contact without nickname is named by id', () {
+      final r = checkImpersonation('candle-rope-sundae', null, contacts);
+      expect(r.headline, 'This name matches candle-rope-sunday');
+    });
+  });
+
+  group('content', () {
+    test('spots crypto addresses by shape', () {
+      expect(
+        _codes(scanFirstMessage('send to 1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2')),
+        ['crypto_address'],
+      );
+      expect(
+        _codes(
+          scanFirstMessage(
+            'bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq works too',
+          ),
+        ),
+        ['crypto_address'],
+      );
+      expect(
+        _codes(
+          scanFirstMessage('eth 0x52908400098527886E0F7030069857D2E4169EE7'),
+        ),
+        ['crypto_address'],
+      );
+      expect(
+        _codes(
+          scanFirstMessage(
+            '4AdUndXHHZ6cfufTMvppY6JwXNouMBzSkbLYfpAV5Usx3skxNgYeYTRj5UzqtReoS44qo9mtmXCqY45DJ852K5Jv2684Rge',
+          ),
+        ),
+        ['crypto_address'],
+      );
+      expect(scanFirstMessage('my number is 0612345678').hits, isEmpty);
+    });
+
+    test('flags money with urgency, not money alone', () {
+      expect(
+        _codes(scanFirstMessage('i need the payment today or it expires')),
+        ['money_rush'],
+      );
+      expect(
+        scanFirstMessage(
+          'the payment went through last month, thanks again for lunch. '
+          'anyway, unrelated, can we meet now?',
+        ).hits,
+        isEmpty,
+      );
+    });
+
+    test('flags an ask to move apps', () {
+      expect(_codes(scanFirstMessage('add me on telegram @notascam')), [
+        'move_app',
+      ]);
+      expect(_codes(scanFirstMessage('whatsapp me later')), ['move_app']);
+      expect(scanFirstMessage('telegram is down again lol').hits, isEmpty);
+    });
+
+    test('spots lookalike hosts', () {
+      expect(lookalikeHost('paypa1.com'), true);
+      expect(lookalikeHost('paypal.com'), false);
+      expect(lookalikeHost('secure.paypal.com'), false);
+      expect(lookalikeHost('gÐ¾ogle.com'), true); // cyrillic o
+      expect(lookalikeHost('binance.co'), true);
+      expect(lookalikeHost('example.org'), false);
+      expect(
+        _codes(scanFirstMessage('verify here https://coinbase.co/login')),
+        ['lookalike_url'],
+      );
+      expect(scanFirstMessage('see https://github.com/x/y').hits, isEmpty);
+    });
+
+    test('a long opener alone never flags', () {
+      final long = List.filled(90, 'hello').join(' ');
+      final r = scanFirstMessage(long);
+      expect(_codes(r), ['long_opener']);
+      expect(r.flagged, false);
+    });
+
+    test('flags asks for a code or seed', () {
+      expect(
+        _codes(scanFirstMessage('what is the verification code you got?')),
+        ['secret_ask'],
+      );
+      expect(_codes(scanFirstMessage('send me your seed phrase to sync')), [
+        'secret_ask',
+      ]);
+      expect(scanFirstMessage('the door code is 4412').hits, isEmpty);
+    });
+
+    test('two rules flag, one does not', () {
+      final one = scanFirstMessage('add me on telegram');
+      expect(one.flagged, false);
+      expect(one.headline, null);
+      final two = scanFirstMessage(
+        'add me on telegram, i need the transfer now before it expires',
+      );
+      expect(two.flagged, true);
+      expect(two.headline, 'Looks like a scam');
+    });
+
+    test('a normal hello stays quiet', () {
+      expect(
+        scanFirstMessage(
+          'hey, sam gave me your kryfo. climbing thursday? '
+          'bring the rope, i have the quickdraws.',
+        ).hits,
+        isEmpty,
+      );
+    });
+  });
+
+  test('joined check puts the name first', () {
+    final r = shieldCheck(
+      strangerId: 'thumb-behave-borins',
+      strangerAvatar: null,
+      firstMessage: 'send me your seed phrase now',
+      contacts: const [ShieldContact('thumb-behave-boring', nickname: 'alice')],
+    );
+    expect(r.flagged, true);
+    expect(_codes(r), ['name_match', 'secret_ask']);
+    expect(r.headline, 'This name matches alice');
+  });
+}
+
+// in a group the id sits on every bubble, so the name proves less: content
+// decides, and a strong rule decides alone
+void _groupTests() {
+  const contacts = [
+    ShieldContact('thumb-behave-boring', nickname: 'alice', avatar: 7),
+  ];
+  group('in a group', () {
+    test('a secret ask flags on its own', () {
+      final r = shieldCheckInGroup(
+        strangerId: 'quiet-lamp-river',
+        strangerAvatar: 1,
+        firstMessage: 'send me your seed phrase to sync',
+        contacts: contacts,
+      );
+      expect(r.flagged, true);
+      expect(r.headline, 'Looks like a scam');
+    });
+    test('one weak rule does not flag', () {
+      final r = shieldCheckInGroup(
+        strangerId: 'quiet-lamp-river',
+        strangerAvatar: 1,
+        firstMessage: 'add me on telegram',
+        contacts: contacts,
+      );
+      expect(r.flagged, false);
+    });
+    test('a matching name alone is not a flag', () {
+      final r = shieldCheckInGroup(
+        strangerId: 'thumb-behave-b0ring',
+        strangerAvatar: 7,
+        firstMessage: 'hello everyone',
+        contacts: contacts,
+      );
+      expect(r.flagged, false);
+    });
+    test('a matching name footnotes a content flag', () {
+      final r = shieldCheckInGroup(
+        strangerId: 'thumb-behave-b0ring',
+        strangerAvatar: 7,
+        firstMessage: 'send me your seed phrase to sync',
+        contacts: contacts,
+      );
+      expect(r.flagged, true);
+      expect(r.headline, 'Looks like a scam');
+      expect(r.hits.last.code, 'name_note');
+      expect(r.hits.last.line, startsWith('Also: name matches'));
+    });
+  });
+}
+

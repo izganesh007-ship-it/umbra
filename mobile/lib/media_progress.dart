@@ -1,0 +1,224 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// live progress for chunked media, both directions: a big file over tor
+// takes minutes, so the sender's bubble shows a percentage and the receiver
+// gets a slim banner above the composer.
+// plain maps and one global tick. the widgets stay mounted and hide
+// themselves, so it does not matter whether the widget or the entry comes
+// first.
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+
+import 'theme.dart';
+import 'theme/theme.dart';
+import 'l10n/l10n.dart';
+import 'l10n/numbers.dart';
+
+/// outgoing: msgUid -> 0..1
+final Map<String, double> mediaSendProgress = {};
+
+/// incoming: chat key (groupId or peer haloId) -> 0..1
+final Map<String, double> incomingMediaProgress = {};
+final Map<String, int> _incomingTouch = {};
+// chat key -> (have, total), and the transfers that went quiet. the slices
+// stay on disk for a week, so a quiet transfer is paused, not lost, and the
+// banner says so.
+final Map<String, (int, int)> _incomingCount = {};
+final Set<String> incomingMediaStalled = {};
+
+/// which chat an outgoing send belongs to (msgUid -> chatKey), so the
+/// banner can show sender-side progress too.
+final Map<String, String> _sendChat = {};
+
+final ValueNotifier<int> mediaProgressTick = ValueNotifier(0);
+Timer? _sweeper;
+
+void _bump() => mediaProgressTick.value++;
+
+// a transfer quiet for 75s is shown as paused; one quiet for a day is
+// dropped from the banner (its slices are swept from the db separately).
+void _ensureSweeper() {
+  _sweeper ??= Timer.periodic(const Duration(seconds: 15), (_) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    var changed = false;
+    for (final e in _incomingTouch.entries.toList()) {
+      final quiet = now - e.value;
+      if (quiet > 86400000) {
+        incomingMediaProgress.remove(e.key);
+        _incomingTouch.remove(e.key);
+        _incomingCount.remove(e.key);
+        incomingMediaStalled.remove(e.key);
+        changed = true;
+      } else if (quiet > 75000 && incomingMediaStalled.add(e.key)) {
+        changed = true;
+      }
+    }
+    if (changed) _bump();
+  });
+}
+
+void mediaProgressStart(String msgUid, {String? chatKey}) {
+  mediaSendProgress.putIfAbsent(msgUid, () => 0);
+  if (chatKey != null) _sendChat[msgUid] = chatKey;
+  _bump();
+}
+
+void mediaProgressUpdate(String msgUid, double v) {
+  mediaSendProgress[msgUid] = v;
+  _bump();
+}
+
+void mediaProgressEnd(String msgUid) {
+  _sendChat.remove(msgUid);
+  if (mediaSendProgress.remove(msgUid) != null) _bump();
+}
+
+void incomingMediaUpdate(String chatKey, int received, int total) {
+  if (total <= 0) return;
+  incomingMediaProgress[chatKey] = received / total;
+  _incomingCount[chatKey] = (received, total);
+  incomingMediaStalled.remove(chatKey);
+  _incomingTouch[chatKey] = DateTime.now().millisecondsSinceEpoch;
+  _ensureSweeper();
+  _bump();
+}
+
+void incomingMediaDone(String chatKey) {
+  _incomingTouch.remove(chatKey);
+  _incomingCount.remove(chatKey);
+  incomingMediaStalled.remove(chatKey);
+  if (incomingMediaProgress.remove(chatKey) != null) _bump();
+}
+
+/// "42%" beside the send pill. always mounted for media bubbles; renders
+/// nothing until its msgUid has a live entry.
+class SendProgressLabel extends StatelessWidget {
+  final String msgUid;
+  const SendProgressLabel({super.key, required this.msgUid});
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+  final colors = UmbraTheme.colorsOf(context);
+
+    return ValueListenableBuilder<int>(
+      valueListenable: mediaProgressTick,
+      builder: (_, _, _) {
+        final v = mediaSendProgress[msgUid];
+        if (v == null) return const SizedBox.shrink();
+        return Padding(
+          padding: const EdgeInsetsDirectional.only(end: 6),
+          child: Text(
+            percent(v),
+            style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10.5, fontWeight: FontWeight.w700, color: colors.accent, letterSpacing: 0.12),
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// slim "receiving media" pill above the composer. self-hiding.
+class IncomingMediaBanner extends StatelessWidget {
+  final String chatKey;
+
+  /// stops an outgoing send from the strip itself
+  final void Function(String msgUid)? onCancel;
+  const IncomingMediaBanner({super.key, required this.chatKey, this.onCancel});
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return ValueListenableBuilder<int>(
+      valueListenable: mediaProgressTick,
+      builder: (_, _, _) {
+        // an outgoing send for this chat comes first: leaving the app can
+        // still break that one
+        double? outV;
+        String? outUid;
+        for (final e in _sendChat.entries) {
+          if (e.value == chatKey) {
+            final v = mediaSendProgress[e.key];
+            if (v != null) {
+              outV = v;
+              outUid = e.key;
+              break;
+            }
+          }
+        }
+        final v = outV ?? incomingMediaProgress[chatKey];
+        if (v == null) return const SizedBox.shrink();
+        final sending = outV != null;
+        // captured as locals so the tap closure keeps a non-null pair
+        final cancelUid = outUid;
+        final cancel = onCancel;
+        final stalled = !sending && incomingMediaStalled.contains(chatKey);
+        final count = _incomingCount[chatKey];
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+            decoration: BoxDecoration(
+              color: colors.surface,
+              borderRadius: BorderRadius.circular(9),
+              border: Border.all(
+                color: colors.accent.withValues(alpha: 0.35),
+              ),
+            ),
+            child: Row(
+              children: [
+                SizedBox(
+                  width: 10,
+                  height: 10,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 1.6,
+                    value: v.clamp(0.05, 1.0),
+                    color: colors.accent,
+                    backgroundColor: colors.separator,
+                  ),
+                ),
+                const SizedBox(width: 9),
+                Flexible(
+                  child: Text(
+                    sending
+                        ? l10n.mediaProgressSendingKeepTheApp(percent(v))
+                        : stalled && count != null
+                        ? l10n.mediaProgressPausedOfWaitingFor(
+                            whole(count.$1),
+                            whole(count.$2),
+                          )
+                        : l10n.mediaProgressReceivingMedia(percent(v)),
+                    style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10.5, fontWeight: FontWeight.w500, color: stalled ? colors.textSecondary : colors.accent, letterSpacing: 0.12),
+                  ),
+                ),
+                if (sending && cancelUid != null && cancel != null) ...[
+                  const SizedBox(width: 10),
+                  Semantics(
+                    button: true,
+                    label: l10n.mediaProgressCancelSending,
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () => cancel(cancelUid),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 6,
+                          vertical: 3,
+                        ),
+                        child: Text(
+                          l10n.commonCancel,
+                          style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10.5, fontWeight: FontWeight.w700, color: colors.textSecondary, letterSpacing: 0.12),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+}

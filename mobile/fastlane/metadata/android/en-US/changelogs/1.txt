@@ -1,0 +1,6 @@
+first public release.
+
+* private 1:1 and group messaging over tor
+* no phone number or account
+* ghost mode, pins, replies, reactions, voice messages, files
+* encrypted backups, app lock, panic wipe

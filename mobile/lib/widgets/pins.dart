@@ -1,0 +1,379 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// pins, the parts both chats share. a pinned message is reached from one
+// place, the pin in the header; nothing sits over the conversation.
+import 'dart:io';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+import '../theme/theme.dart';
+import 'decode_px.dart';
+import 'halo_sheet.dart';
+import 'kryfo_avatar.dart';
+import 'sheet_handle.dart';
+import '../l10n/l10n.dart';
+import '../l10n/dates.dart';
+import '../l10n/numbers.dart';
+
+/// how many pins one chat holds. the sender checks before pinning and the
+/// receiver checks before mirroring, so nobody can fill the list from afar.
+const kMaxPins = 50;
+
+/// the pin in a chat header. always there, the way search is: quiet with
+/// nothing pinned, amber with a count once something is.
+class PinHeaderButton extends StatelessWidget {
+  final int count;
+  final VoidCallback? onTap;
+  const PinHeaderButton({super.key, required this.count, this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+  final colors = UmbraTheme.colorsOf(context);
+
+    final on = count > 0;
+    return IconButton(
+      tooltip: on
+          ? l10n.pinsPinnedMessages(whole(count))
+          : l10n.pinsPinnedMessages2,
+      onPressed: onTap,
+      icon: SizedBox(
+        width: 26,
+        height: 24,
+        child: Stack(
+          clipBehavior: Clip.none,
+          children: [
+            Align(
+              alignment: AlignmentDirectional.centerStart,
+              child: Transform.rotate(
+                angle: 0.5,
+                child: Icon(
+                  on ? Icons.push_pin : Icons.push_pin_outlined,
+                  color: on ? colors.accent : colors.textSecondary,
+                  size: 19,
+                ),
+              ),
+            ),
+            // the count is in the tooltip; read out alone it is just "1"
+            if (on)
+              PositionedDirectional(
+                end: -2,
+                top: -1,
+                child: Container(
+                  constraints: const BoxConstraints(minWidth: 14),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 3.5,
+                    vertical: 0.5,
+                  ),
+                  decoration: BoxDecoration(
+                    color: colors.accent,
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: ExcludeSemantics(
+                    child: Text(
+                      count > 99 ? '99' : '$count',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 8.5, fontWeight: FontWeight.w600, color: colors.accentOn, letterSpacing: 0),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// one row of the pins list
+class PinEntry {
+  final String uid;
+  final String author; // the name to show: 'You', a contact, a member
+  final String authorSeed; // what the avatar is drawn from
+  final int? face;
+  final DateTime when;
+  final String text;
+  final String? imagePath;
+  final String? fileName;
+  const PinEntry({
+    required this.uid,
+    required this.author,
+    required this.authorSeed,
+    required this.when,
+    required this.text,
+    this.face,
+    this.imagePath,
+    this.fileName,
+  });
+
+  /// what stands in for the words when there are none
+  String get preview {
+    if (text.trim().isNotEmpty) return text.trim();
+    if (imagePath != null) return l10n.pinsPhoto;
+    if (fileName == 'voice.wav') return l10n.pinsVoiceMessage;
+    if (fileName != null) return fileName!;
+    return l10n.pinsMessage;
+  }
+}
+
+String _pinDate(DateTime d) {
+  final hm = hourMinute(d);
+  final now = DateTime.now();
+  if (d.year == now.year && d.month == now.month && d.day == now.day) {
+    return l10n.pinsToday(hm);
+  }
+  return '${dayMonthMaybeYear(d, now: now)} · $hm';
+}
+
+/// the list of pins. [load] is asked again after every unpin so the sheet
+/// shows what the database holds, not what it was opened with. [onJump]
+/// runs after the sheet has closed.
+Future<void> showPinsSheet(
+  BuildContext context, {
+  required Future<List<PinEntry>> Function() load,
+  required void Function(PinEntry e) onJump,
+  required Future<void> Function(PinEntry e) onUnpin,
+}) {
+  return showHaloSheet<void>(
+    context,
+    scroll: true,
+    builder: (ctx) => _PinsSheet(load: load, onJump: onJump, onUnpin: onUnpin),
+  );
+}
+
+class _PinsSheet extends StatefulWidget {
+  final Future<List<PinEntry>> Function() load;
+  final void Function(PinEntry e) onJump;
+  final Future<void> Function(PinEntry e) onUnpin;
+  const _PinsSheet({
+    required this.load,
+    required this.onJump,
+    required this.onUnpin,
+  });
+  @override
+  State<_PinsSheet> createState() => _PinsSheetState();
+}
+
+class _PinsSheetState extends State<_PinsSheet> {
+  List<PinEntry>? _pins;
+
+  @override
+  void initState() {
+    super.initState();
+    _reload();
+  }
+
+  Future<void> _reload() async {
+    final p = await widget.load();
+    if (mounted) setState(() => _pins = p);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    final pins = _pins;
+    final tall = MediaQuery.of(context).size.height * 0.78;
+    return SafeArea(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: tall),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Center(child: SheetHandle()),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(22, 14, 22, 2),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Text(
+                    l10n.pinsPinned,
+                    style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 22, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.normal, height: 1.05, letterSpacing: -0.015),
+                  ),
+                  const Spacer(),
+                  if (pins != null && pins.isNotEmpty)
+                    Text(
+                      l10n.pinsOf(whole(pins.length), whole(kMaxPins)),
+                      style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.12),
+                    ),
+                ],
+              ),
+            ),
+            if (pins == null)
+              const SizedBox(height: 120)
+            else if (pins.isEmpty)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(22, 10, 22, 30),
+                child: Text(
+                  l10n.pinsNothingPinnedHereYet,
+                  style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13.5, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+                ),
+              )
+            else
+              Flexible(
+                child: ListView.separated(
+                  shrinkWrap: true,
+                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 18),
+                  itemCount: pins.length,
+                  separatorBuilder: (_, _) => const SizedBox(height: 10),
+                  itemBuilder: (_, i) => _PinCard(
+                    e: pins[i],
+                    onJump: () {
+                      HapticFeedback.selectionClick();
+                      Navigator.of(context).pop();
+                      widget.onJump(pins[i]);
+                    },
+                    onUnpin: () async {
+                      HapticFeedback.selectionClick();
+                      await widget.onUnpin(pins[i]);
+                      await _reload();
+                    },
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _PinCard extends StatelessWidget {
+  final PinEntry e;
+  final VoidCallback onJump;
+  final VoidCallback onUnpin;
+  const _PinCard({
+    required this.e,
+    required this.onJump,
+    required this.onUnpin,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    final img = e.imagePath;
+    return Container(
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        color: colors.surfaceHover,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: colors.separator, width: 0.5),
+      ),
+      child: IntrinsicHeight(
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // the amber rule marks a pin
+            Container(width: 3, color: colors.accent),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 11, 12, 8),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        KryfoAvatar(
+                          seed: e.authorSeed,
+                          size: 20,
+                          choice: e.face,
+                        ),
+                        const SizedBox(width: 8),
+                        Flexible(
+                          child: Text(
+                            e.author,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 12.5, fontWeight: FontWeight.w600, color: colors.textPrimary, height: 1.5, letterSpacing: 0),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          _pinDate(e.when),
+                          style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 9.5, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.12),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Expanded(
+                          child: Text(
+                            e.preview,
+                            maxLines: 3,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13.5, fontWeight: FontWeight.w400, color: colors.textPrimary, height: 1.4, letterSpacing: 0),
+                          ),
+                        ),
+                        if (img != null) ...[
+                          const SizedBox(width: 10),
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(UmbraRadius.md),
+                            child: Image.file(
+                              File(img),
+                              width: 52,
+                              height: 52,
+                              fit: BoxFit.cover,
+                              cacheWidth: decodePx(context, 52),
+                              errorBuilder: (_, _, _) =>
+                                  const SizedBox(width: 52, height: 52),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        _PinAction(
+                          label: l10n.pinsJump,
+                          amber: true,
+                          onTap: onJump,
+                        ),
+                        const SizedBox(width: 6),
+                        _PinAction(label: l10n.pinsUnpin, onTap: onUnpin),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _PinAction extends StatelessWidget {
+  final String label;
+  final bool amber;
+  final VoidCallback onTap;
+  const _PinAction({
+    required this.label,
+    required this.onTap,
+    this.amber = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: onTap,
+      child: Padding(
+        // a full-height target around a small word
+        padding: const EdgeInsetsDirectional.fromSTEB(0, 8, 14, 6),
+        child: Text(
+          label,
+          style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 12.5, fontWeight: FontWeight.w600, color: amber ? colors.accent : colors.textSecondary, height: 1.5, letterSpacing: 0),
+        ),
+      ),
+    );
+  }
+}

@@ -1,0 +1,7 @@
+Move Kryfo to another phone: a move retires the old phone, and the restore says what comes over before it writes anything.
+
+Backups now include photos, voice notes and files, and old backups still restore.
+
+Gallery videos lose where, when and on what phone they were filmed. There is a video tile next to the gif one.
+
+Fixed: onion picked at setup could leave the app on the relay, scanning a code from the first screen added nobody, and the backup button could sit out of reach.

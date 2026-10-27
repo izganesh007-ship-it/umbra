@@ -1,0 +1,133 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+import 'package:flutter/material.dart';
+import '../theme/theme.dart';
+import '../main.dart' show appState;
+import '../widgets/stagger_in.dart';
+import '../l10n/l10n.dart';
+
+// blocked contacts. blocking never notifies the other side.
+class BlockedScreen extends StatefulWidget {
+  const BlockedScreen({super.key});
+
+  @override
+  State<BlockedScreen> createState() => _BlockedScreenState();
+}
+
+class _BlockedScreenState extends State<BlockedScreen> {
+  List<({String haloId, String? nickname})> _blocked = [];
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final list = await appState.blockedContacts();
+    if (mounted) {
+      setState(() {
+        _blocked = list;
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _unblock(String haloId) async {
+    await appState.unblock(haloId);
+    await _load();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return Scaffold(
+      backgroundColor: colors.surface,
+      body: SafeArea(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsetsDirectional.fromSTEB(4, 4, 8, 8),
+              child: Row(
+                children: [
+                  IconButton(
+                    tooltip: l10n.commonBack,
+                    icon: Icon(
+                      Icons.chevron_left,
+                      color: colors.textSecondary,
+                      size: 26,
+                    ),
+                    onPressed: () => Navigator.of(context).pop(),
+                  ),
+                  Text(
+                    l10n.blockedBlocked,
+                    style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 22, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.normal, height: 1.05, letterSpacing: -0.015),
+                  ),
+                ],
+              ),
+            ),
+            Expanded(
+              child: _loading
+                  ? const SizedBox()
+                  : _blocked.isEmpty
+                  ? Center(
+                      child: StaggerIn(
+                        index: 0,
+                        child: Text(
+                          l10n.blockedNoOneIsBlocked,
+                          style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 18, fontWeight: FontWeight.w400, color: colors.textSecondary, fontStyle: FontStyle.italic, height: 1.05, letterSpacing: -0.015),
+                        ),
+                      ),
+                    )
+                  : ListView(
+                      padding: const EdgeInsets.symmetric(vertical: 8),
+                      children: [
+                        for (final (i, c) in _blocked.indexed)
+                          StaggerIn(
+                            index: i,
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 20,
+                                vertical: 12,
+                              ),
+                              child: Row(
+                                children: [
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                          c.nickname ?? c.haloId,
+                                          style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w500, height: 1.5, letterSpacing: 0),
+                                        ),
+                                        if (c.nickname != null)
+                                          Text(
+                                            c.haloId,
+                                            style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 10, fontWeight: FontWeight.w500, color: colors.textTertiary, letterSpacing: 0.12),
+                                          ),
+                                      ],
+                                    ),
+                                  ),
+                                  TextButton(
+                                    onPressed: () => _unblock(c.haloId),
+                                    child: Text(
+                                      l10n.commonUnblock,
+                                      style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w500, color: colors.accent, height: 1.5, letterSpacing: 0),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}

@@ -1,0 +1,5 @@
+Kryfo no longer re-downloads the same messages every fifteen minutes, which could use a lot of mobile data.
+
+Media shows delivered only once it has arrived. One bad piece no longer fails a whole transfer. Voice notes carry on where they stopped. Sends can be cancelled from the strip, in groups too.
+
+Smaller fixes to the date label, missing photos and pictures sent as files.

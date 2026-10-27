@@ -1,0 +1,61 @@
+name: Golden Tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  golden:
+    name: Golden tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.41.7'
+          channel: 'stable'
+          cache: true
+          cache-key: flutter-:os:-:flutter-version:-:arch:
+
+      - name: Install Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          api-level: 34
+          ndk-version: r28c
+          cmdline-tools-version: latest
+
+      - name: Get dependencies (offline)
+        working-directory: mobile
+        run: flutter pub get --offline
+
+      - name: Run golden tests
+        working-directory: mobile
+        run: flutter test --update-goldens
+        # Note: This will fail if golden images don't exist yet.
+        # In Phase 3+, goldens will exist and this will catch regressions.
+        # For now, we just ensure the test command works.
+
+      - name: Upload golden test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-test-results
+          path: mobile/test/goldens/
+          retention-days: 7

@@ -1,0 +1,44 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// what stands where the composer was, on a phone whose identity has moved.
+// the engine is not running, so a message typed here would sit in the
+// outbox forever; better that there is nowhere to type it.
+import 'package:flutter/material.dart';
+
+import '../theme/theme.dart';
+import '../l10n/l10n.dart';
+
+class MovedStrip extends StatelessWidget {
+  const MovedStrip({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+  final colors = UmbraTheme.colorsOf(context);
+
+    return SafeArea(
+      top: false,
+      child: Container(
+        margin: const EdgeInsets.fromLTRB(16, 8, 16, 10),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+        decoration: BoxDecoration(
+          color: colors.surfaceElevated,
+          borderRadius: BorderRadius.circular(UmbraRadius.lg),
+          border: Border.all(color: colors.separator, width: 0.5),
+        ),
+        child: Row(
+          children: [
+            Icon(Icons.lock_outline, size: 16, color: colors.textTertiary),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                l10n.movedStripThisKryfoHasMoved,
+                style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 12.5, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.35, letterSpacing: 0),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}

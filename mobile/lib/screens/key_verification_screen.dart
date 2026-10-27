@@ -1,0 +1,230 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+import 'dart:convert';
+import 'package:crypto/crypto.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import '../theme/theme.dart';
+import '../widgets/stagger_in.dart';
+import '../widgets/press_scale.dart';
+import '../main.dart' show db, appState;
+import '../l10n/l10n.dart';
+
+// safety number for a contact: 60 digits from both X25519 public keys,
+// order-independent so both phones show the same number. a match on both
+// ends means no one is in the middle; a name can be faked, this cannot.
+String haloSafetyNumber(String myXpubHex, String peerXpubHex) {
+  final a = myXpubHex.toLowerCase().trim();
+  final b = peerXpubHex.toLowerCase().trim();
+  final ordered = a.compareTo(b) <= 0 ? '$a:$b' : '$b:$a';
+  final d1 = sha256.convert(utf8.encode(ordered)).bytes;
+  final d2 = sha256.convert(d1).bytes;
+  final bytes = <int>[...d1, ...d2];
+  final groups = <String>[];
+  for (var i = 0; i < 12; i++) {
+    final o = i * 4;
+    final n =
+        (bytes[o] << 24) |
+        (bytes[o + 1] << 16) |
+        (bytes[o + 2] << 8) |
+        bytes[o + 3];
+    groups.add(((n & 0x7fffffff) % 100000).toString().padLeft(5, '0'));
+  }
+  return groups.join(' ');
+}
+
+class KeyVerificationScreen extends StatefulWidget {
+  final String peerHaloId;
+  final String peerName;
+  final String myXpub;
+  final String peerXpub;
+  const KeyVerificationScreen({
+    super.key,
+    required this.peerHaloId,
+    required this.peerName,
+    required this.myXpub,
+    required this.peerXpub,
+  });
+
+  @override
+  State<KeyVerificationScreen> createState() => _KeyVerificationScreenState();
+}
+
+class _KeyVerificationScreenState extends State<KeyVerificationScreen> {
+  bool _verified = false;
+
+  @override
+  void initState() {
+    super.initState();
+    db.isVerified(widget.peerHaloId).then((v) {
+      if (mounted) setState(() => _verified = v);
+    });
+  }
+
+  Future<void> _toggle() async {
+    final next = !_verified;
+    await db.setVerified(widget.peerHaloId, next);
+    // the new key is already trusted and the session rebuilt on the inbound
+    // message (deliver-and-warn), so verifying only clears the banner. a
+    // session teardown here would break sending.
+    if (next && await db.keyChanged(widget.peerHaloId)) {
+      await db.clearKeyChanged(widget.peerHaloId);
+    }
+    await appState.refreshContacts();
+    if (next) HapticFeedback.mediumImpact();
+    if (mounted) setState(() => _verified = next);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+  final colors = UmbraTheme.colorsOf(context);
+
+    final groups = haloSafetyNumber(widget.myXpub, widget.peerXpub).split(' ');
+    return Scaffold(
+      backgroundColor: colors.surface,
+      body: SafeArea(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsetsDirectional.fromSTEB(4, 4, 8, 4),
+              child: Row(
+                children: [
+                  IconButton(
+                    tooltip: l10n.commonBack,
+                    icon: Icon(
+                      Icons.chevron_left,
+                      color: colors.textSecondary,
+                      size: 26,
+                    ),
+                    onPressed: () => Navigator.of(context).pop(),
+                  ),
+                  Text(
+                    l10n.keyVerificationSafetyNumber,
+                    style: TextStyle(fontFamily: UmbraTypography.fontSerif, fontSize: 22, fontWeight: FontWeight.w400, color: colors.textPrimary, fontStyle: FontStyle.normal, height: 1.05, letterSpacing: -0.015),
+                  ),
+                ],
+              ),
+            ),
+            Expanded(
+              child: ListView(
+                padding: const EdgeInsets.fromLTRB(24, 8, 24, 24),
+                children: [
+                  StaggerIn(
+                    index: 0,
+                    child: Text(
+                      l10n.keyVerificationWith(widget.peerName),
+                      style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+                    ),
+                  ),
+                  const SizedBox(height: 24),
+                  StaggerIn(
+                    index: 1,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 20,
+                        vertical: 24,
+                      ),
+                      decoration: BoxDecoration(
+                        color: colors.surfaceElevated,
+                        borderRadius: BorderRadius.circular(UmbraRadius.xl),
+                        border: Border.all(color: colors.separator, width: 0.5),
+                      ),
+                      child: Wrap(
+                        spacing: 18,
+                        runSpacing: 14,
+                        alignment: WrapAlignment.center,
+                        children: [
+                          // each group lands a beat after the last, so the
+                          // number assembles instead of popping in
+                          for (var i = 0; i < groups.length; i++)
+                            StaggerIn(
+                              index: i + 2,
+                              child: Text(
+                                groups[i],
+                                style: TextStyle(fontFamily: UmbraTypography.fontMono, fontSize: 18, fontWeight: FontWeight.w500, color: colors.textPrimary, letterSpacing: 1.0),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 24),
+                  StaggerIn(
+                    index: 4,
+                    child: Text(
+                      l10n.keyVerificationIfSeesTheSame(widget.peerName),
+                      style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 13, fontWeight: FontWeight.w400, color: colors.textSecondary, height: 1.5, letterSpacing: 0),
+                    ),
+                  ),
+                  const SizedBox(height: 28),
+                  StaggerIn(
+                    index: 6,
+                    child: _VerifyButton(verified: _verified, onTap: _toggle),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _VerifyButton extends StatelessWidget {
+  final bool verified;
+  final VoidCallback onTap;
+  const _VerifyButton({required this.verified, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+  final colors = UmbraTheme.colorsOf(context);
+
+    return PressScale(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 280),
+        curve: UmbraMotion.easeOut,
+        padding: const EdgeInsets.symmetric(vertical: 16),
+        decoration: BoxDecoration(
+          color: verified ? colors.successSoft : colors.surfaceElevated,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+            color: verified
+                ? colors.success.withValues(alpha: 0.55)
+                : colors.separator,
+            width: 0.5,
+          ),
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            AnimatedSwitcher(
+              duration: const Duration(milliseconds: 260),
+              transitionBuilder: (child, anim) =>
+                  ScaleTransition(scale: anim, child: child),
+              child: Icon(
+                verified ? Icons.verified_user : Icons.verified_user_outlined,
+                key: ValueKey(verified),
+                size: 18,
+                color: verified ? colors.success : colors.textSecondary,
+              ),
+            ),
+            const SizedBox(width: 10),
+            AnimatedDefaultTextStyle(
+              duration: const Duration(milliseconds: 260),
+              style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: 14, fontWeight: FontWeight.w500, color: verified ? colors.success : colors.textPrimary, height: 1.5, letterSpacing: 0),
+              child: Text(
+                verified
+                    ? l10n.keyVerificationVerified
+                    : l10n.keyVerificationMarkAsVerified,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
