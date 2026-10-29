@@ -9,6 +9,7 @@ import '../widgets/widgets.dart';
 import '../app_state.dart';
 import '../dlog.dart';
 import '../wipe.dart';
+import '../models/previews.dart';
 
 class ChatListScreen extends StatefulWidget {
   final String? haloId;
@@ -153,7 +154,7 @@ class _ChatListScreenState extends State<ChatListScreen>
         name: group.name,
         preview: null, // Would need group preview
         lastMessageTime: group.expiresAt != null
-            ? DateTime.fromMillisecondsSinceEpoch(group.expiresAt! * 1000)
+            ? DateTime.fromMillisecondsSinceEpoch(group.expiresAt!)
             : null,
         unreadCount: group.unread ?? 0,
         isPinned: false, // Groups don't support pin yet

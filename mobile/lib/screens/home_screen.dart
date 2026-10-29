@@ -30,6 +30,7 @@ import 'bridges_screen.dart';
 import 'archived_screen.dart';
 import '../miui_autostart.dart';
 import '../main.dart';
+import '../models/previews.dart';
 import '../widgets/motion.dart';
 import '../widgets/halo_sheet.dart';
 import '../widgets/sheet_handle.dart';
@@ -433,38 +434,6 @@ Route<void> _archivedRoute() {
       );
     },
   );
-}
-
-class ContactPreview {
-  final String haloId;
-  final String? nickname;
-  final String? preview;
-  final DateTime? when;
-  final String avatarSeed;
-  // the face they picked, if they have. null means draw from their id.
-  final int? avatar;
-  final bool blocked;
-  final bool archived;
-  final bool muted;
-  final bool verified;
-  final int unread;
-  final bool pinned;
-  final String? supporterBadge;
-  ContactPreview({
-    required this.haloId,
-    this.nickname,
-    this.preview,
-    this.when,
-    required this.avatarSeed,
-    this.avatar,
-    this.blocked = false,
-    this.archived = false,
-    this.muted = false,
-    this.verified = false,
-    this.unread = 0,
-    this.pinned = false,
-    this.supporterBadge,
-  });
 }
 
 // minimal shape needed by home for rendering a group row. main.dart

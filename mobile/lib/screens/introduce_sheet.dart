@@ -6,7 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../intro_budget.dart';
 import '../main.dart' show appState;
-import '../screens/home_screen.dart' show ContactPreview;
+import '../models/previews.dart';
 import '../theme/theme.dart';
 import '../vouch_text.dart';
 import '../widgets/kryfo_avatar.dart';

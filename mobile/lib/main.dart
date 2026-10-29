@@ -32,7 +32,7 @@ import 'helper_push.dart';
 import 'screens/getting_messages_screen.dart';
 import 'screens/chat_list_screen.dart';
 import 'screens/chat_screen_new.dart' as chat_new;
-import 'screens/home_screen.dart';
+import 'models/previews.dart';
 import 'screens/new_group_screen_new.dart';
 import 'screens/room_create_sheet.dart';
 import 'screens/room_link_sheet.dart';
@@ -3982,26 +3982,7 @@ String newMsgUid() {
   return '${t.padLeft(8, '0').substring(0, 8)}${r.substring(0, 4).padLeft(4, '0')}';
 }
 
-class GroupPreview {
-  final String groupId;
-  final String name;
-  final int memberCount;
-  final bool isAdmin;
-  final DateTime createdAt;
-  final int unread;
-  final bool mentioned; // someone wrote your three words since you last read
-  final int? expiresAt; // a burner room's end, null for a group
-  const GroupPreview({
-    required this.groupId,
-    required this.name,
-    required this.memberCount,
-    required this.isAdmin,
-    required this.createdAt,
-    this.unread = 0,
-    this.mentioned = false,
-    this.expiresAt,
-  });
-}
+
 
 class AppState extends ChangeNotifier {
   // signalDecrypt lives outside this class but has to repaint the banners
