@@ -819,7 +819,22 @@ class _GroupChatScreenState extends State<GroupChatScreen>
   }
 
   void _showGroupMenu() {
-    // TODO: Show group menu
+    showHaloSheet(
+      context,
+      builder: (sheetCtx) => Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ListTile(
+            leading: Icon(Icons.info_outline_rounded, color: UmbraTheme.colorsOf(context).textPrimary),
+            title: Text(l10n.appGroupInfo, style: TextStyle(fontFamily: UmbraTypography.fontSans, fontSize: UmbraTypography.textBase, color: UmbraTheme.colorsOf(context).textPrimary)),
+            onTap: () {
+              Navigator.pop(sheetCtx);
+              Navigator.push(context, haloRoute(GroupInfoScreen(groupId: widget.groupId)));
+            },
+          ),
+        ],
+      ),
+    );
   }
 
   void _showAttachMenu() {

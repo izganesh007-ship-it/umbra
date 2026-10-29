@@ -43,6 +43,7 @@ import 'screens/pair_code_screen.dart';
 import 'screens/scan_screen.dart';
 import 'screens/modes_screen.dart';
 import 'screens/settings_screen_new.dart';
+import 'screens/tools_screen_new.dart';
 import 'screens/my_kryfo_screen.dart';
 import 'screens/onboarding_screen_new.dart';
 import 'lock_state.dart';
@@ -8403,6 +8404,7 @@ class _RootShellState extends State<RootShell> {
       onNewRoom: () => _createNewRoom(context),
       expiredRoomName: appState.expiredRoomName,
       onOpenSettings: () => Navigator.push(context, haloRoute(const SettingsScreen())),
+      onOpenTools: () => Navigator.push(context, haloRoute(const ToolsScreen())),
       onOpenChat: (peerHaloId, {peerOnion, peerXPub, avatarSeed, avatarChoice}) =>
           openChatForHalo(peerHaloId),
       onOpenGroup: (groupId) => Navigator.push(

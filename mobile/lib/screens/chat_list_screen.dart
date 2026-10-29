@@ -21,6 +21,7 @@ class ChatListScreen extends StatefulWidget {
   final VoidCallback? onNewRoom;
   final String? expiredRoomName;
   final VoidCallback? onOpenSettings;
+  final VoidCallback? onOpenTools;
   final Function(String peerHaloId, {String? peerOnion, String? peerXPub, int? avatarSeed, String? avatarChoice})? onOpenChat;
   final Function(String groupId)? onOpenGroup;
 
@@ -35,6 +36,7 @@ class ChatListScreen extends StatefulWidget {
     this.onNewRoom,
     this.expiredRoomName,
     this.onOpenSettings,
+    this.onOpenTools,
     this.onOpenChat,
     this.onOpenGroup,
   });
@@ -243,10 +245,9 @@ class _ChatListScreenState extends State<ChatListScreen>
     widget.onOpenSettings?.call();
   }
 
-  void _togglePin(String haloId) {
-    appState.setPinned(haloId, !_pinnedChats.any((c) => c.id == haloId));
+  void _onTools() {
+    widget.onOpenTools?.call();
   }
-
   void _toggleMute(String haloId) {
     final isMuted = _chats.any((c) => c.id == haloId && c.isMuted) ||
         _pinnedChats.any((c) => c.id == haloId && c.isMuted);
@@ -330,6 +331,13 @@ class _ChatListScreenState extends State<ChatListScreen>
                     icon: Icons.settings_rounded,
                     onPressed: _onSettings,
                     tooltip: 'Settings',
+                  ),
+                  SizedBox(width: UmbraSpacing.space1),
+                  // Tools button
+                  _NavActionButton(
+                    icon: Icons.build_rounded,
+                    onPressed: _onTools,
+                    tooltip: 'Tools',
                   ),
                 ],
               ),
