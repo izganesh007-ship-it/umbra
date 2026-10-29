@@ -4,6 +4,36 @@
 - Forked from Kryfo-android, renamed to Umbra
 - GPL-3.0 preserved with Kryfo attribution
 
+## [0.3.3] - 2026-10-30
+
+### Added
+- iMessage-calibrated design system (Sol/Umbra themes) with exact token parity
+- Radial eclipse wipe theme transition (600ms spring animation)
+- Foundation widgets: UmbraBubble, UmbraInputBar, UmbraNavBar, UmbraChatItem, UmbraAvatar, EclipseWipe
+- Rebuilt ChatListScreen with large/collapsed nav bar, search, swipe actions
+- Rebuilt ChatScreen with bubbles, replies, reactions, pins, media
+- OnboardingScreen with 3-screen flow (welcome, identity, pairing)
+- SettingsScreen with Appearance/Chats/Privacy/Advanced sections
+- ToolsScreen with photo cleaner, QR codes, age encryption, diagnostics
+- NewGroupScreen with member selection and group creation
+- GroupChatScreen with group messages, reactions, info menu
+- GroupInfoScreen with member management, group settings
+- Design token verification tests (14 tests covering colors, spacing, motion)
+- Integration test suite for E2E flows
+
+### Changed
+- Theme system migrated from HaloColors to UmbraThemeController
+- Navigation: RootShell uses new ChatListScreen with Tools button
+- Fonts: Fraunces (display), Inter Variable (body), JetBrains Mono (timestamps)
+- Motion: 150/200/300ms durations, cubic-bezier(0.34, 1.56, 0.64, 1) spring
+- Reduced motion: all durations → 0ms, springs → linear
+- Version bumped to 0.3.3+19
+
+### Fixed
+- ContactPreview/GroupPreview duplicate definitions consolidated to shared models
+- expiresAt milliseconds vs seconds bug in chat list
+- Theme imports updated throughout codebase
+
 ## [0.3.2] - 2026-09-25
 
 ### Security
