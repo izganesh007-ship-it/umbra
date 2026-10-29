@@ -21,7 +21,6 @@ import 'package:qr_flutter/qr_flutter.dart';
 import 'package:sqflite_sqlcipher/sqflite.dart';
 
 import 'theme.dart';
-import 'theme/theme.dart';
 import 'wipe.dart';
 import 'media_progress.dart';
 import 'media_send.dart';
