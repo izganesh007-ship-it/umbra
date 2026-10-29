@@ -410,8 +410,8 @@ ThemeData buildUmbraThemeData({
           borderRadius: BorderRadius.circular(UmbraRadius.full),
         ),
         padding: EdgeInsets.symmetric(
-          horizontal: UmbraSpacing.UmbraSpacing.space4,
-          vertical: UmbraSpacing.UmbraSpacing.space2,
+          horizontal: UmbraSpacing.space4,
+          vertical: UmbraSpacing.space2,
         ),
         textStyle: _textStyle(colors, size: UmbraTypography.textSm, weight: UmbraTypography.weightSemibold),
         minimumSize: const Size(88, 40),
@@ -427,8 +427,8 @@ ThemeData buildUmbraThemeData({
           borderRadius: BorderRadius.circular(UmbraRadius.full),
         ),
         padding: EdgeInsets.symmetric(
-          horizontal: UmbraSpacing.UmbraSpacing.space4,
-          vertical: UmbraSpacing.UmbraSpacing.space2,
+          horizontal: UmbraSpacing.space4,
+          vertical: UmbraSpacing.space2,
         ),
         textStyle: _textStyle(colors, size: UmbraTypography.textSm, weight: UmbraTypography.weightSemibold),
         minimumSize: const Size(88, 40),
@@ -443,8 +443,8 @@ ThemeData buildUmbraThemeData({
           borderRadius: BorderRadius.circular(UmbraRadius.full),
         ),
         padding: EdgeInsets.symmetric(
-          horizontal: UmbraSpacing.UmbraSpacing.space3,
-          vertical: UmbraSpacing.UmbraSpacing.space1,
+          horizontal: UmbraSpacing.space3,
+          vertical: UmbraSpacing.space1,
         ),
         textStyle: _textStyle(colors, size: UmbraTypography.textSm, weight: UmbraTypography.weightMedium),
         minimumSize: const Size(64, 36),
@@ -464,8 +464,8 @@ ThemeData buildUmbraThemeData({
           borderRadius: BorderRadius.circular(UmbraRadius.full),
         ),
         padding: EdgeInsets.symmetric(
-          horizontal: UmbraSpacing.UmbraSpacing.space4,
-          vertical: UmbraSpacing.UmbraSpacing.space2,
+          horizontal: UmbraSpacing.space4,
+          vertical: UmbraSpacing.space2,
         ),
         textStyle: _textStyle(colors, size: UmbraTypography.textSm, weight: UmbraTypography.weightSemibold),
         minimumSize: const Size(88, 40),
@@ -480,7 +480,7 @@ ThemeData buildUmbraThemeData({
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(UmbraRadius.full),
         ),
-        padding: EdgeInsets.all(UmbraSpacing.UmbraSpacing.space2),
+        padding: EdgeInsets.all(UmbraSpacing.space2),
       ),
     ),
     floatingActionButtonTheme: FloatingActionButtonThemeData(
@@ -503,7 +503,7 @@ ThemeData buildUmbraThemeData({
       secondarySelectedColor: colors.accentSoft,
       labelStyle: _textStyle(colors, size: UmbraTypography.textSm, weight: UmbraTypography.weightMedium),
       secondaryLabelStyle: _textStyle(colors, size: UmbraTypography.textSm, weight: UmbraTypography.weightMedium, color: colors.accentOn),
-      padding: EdgeInsets.symmetric(horizontal: UmbraSpacing.UmbraSpacing.space2, vertical: UmbraSpacing.UmbraSpacing.space1),
+      padding: EdgeInsets.symmetric(horizontal: UmbraSpacing.space2, vertical: UmbraSpacing.space1),
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(UmbraRadius.full),
         side: BorderSide(color: colors.separator, width: 0.5),
@@ -586,7 +586,7 @@ ThemeData buildUmbraThemeData({
       }),
     ),
     listTileTheme: ListTileThemeData(
-      contentPadding: EdgeInsets.symmetric(horizontal: UmbraSpacing.UmbraSpacing.space4, vertical: UmbraSpacing.UmbraSpacing.space1),
+      contentPadding: EdgeInsets.symmetric(horizontal: UmbraSpacing.space4, vertical: UmbraSpacing.space1),
       titleTextStyle: _textStyle(colors, size: UmbraTypography.textBase, weight: UmbraTypography.weightMedium),
       subtitleTextStyle: _textStyle(colors, size: UmbraTypography.textSm, color: colors.textSecondary),
       leadingAndTrailingTextStyle: _textStyle(colors, size: UmbraTypography.textSm, color: colors.textTertiary),
@@ -603,7 +603,7 @@ ThemeData buildUmbraThemeData({
         boxShadow: colors.shadowMd,
       ),
       textStyle: _textStyle(colors, size: UmbraTypography.textXs, color: colors.textInverse),
-      padding: EdgeInsets.symmetric(horizontal: UmbraSpacing.UmbraSpacing.space3, vertical: UmbraSpacing.UmbraSpacing.space2),
+      padding: EdgeInsets.symmetric(horizontal: UmbraSpacing.space3, vertical: UmbraSpacing.space2),
       preferBelow: true,
       verticalOffset: 8,
     ),

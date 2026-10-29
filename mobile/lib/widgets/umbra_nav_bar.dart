@@ -107,13 +107,7 @@ class UmbraNavBar extends StatelessWidget {
                 ),
               )
             : null,
-        boxShadow: [
-          BoxShadow(
-            color: colors.shadowFrosted.color,
-            blurRadius: colors.shadowFrosted.blurRadius,
-            offset: colors.shadowFrosted.offset,
-          ),
-        ],
+        boxShadow: colors.shadowFrosted,
       ),
       child: ClipRRect(
         child: BackdropFilter(

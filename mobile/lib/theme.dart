@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // kryfo design tokens: colour and type, in one place.
+// Updated to use Umbra design system tokens from theme/tokens.dart and theme/umbra_theme.dart
 
 import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'l10n/l10n.dart';
+import 'theme/tokens.dart';
+import 'theme/umbra_theme.dart';
 
 class _Palette {
   final Color ink, surface, surface2, surface3, line, line2;
