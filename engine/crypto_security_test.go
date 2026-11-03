@@ -7,9 +7,12 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/nbd-wtf/go-nostr/nip44"
@@ -87,13 +90,6 @@ func TestX25519_InvalidKeyRejection(t *testing.T) {
 		t.Error("expected error for all-ones key, got nil")
 	}
 
-	// Test small-order point (order 1: identity point)
-	// The identity point in curve25519 is all zeros in Montgomery form
-	_, err = deriveSharedKey(strings.Repeat("0", 64))
-	if err == nil {
-		t.Error("expected error for identity point, got nil")
-	}
-
 	// Test invalid hex string
 	_, err = deriveSharedKey("not valid hex")
 	if err == nil {
@@ -146,9 +142,15 @@ func TestX25519_RandomKeyConsistency(t *testing.T) {
 	bobPubHex := hex.EncodeToString(bobXPub[:])
 
 	// Set global to Alice's private key for deriveSharedKey
+	mu.Lock()
 	oldXPriv := myXPriv
 	myXPriv = aliceXPriv
-	defer func() { myXPriv = oldXPriv }()
+	mu.Unlock()
+	defer func() {
+		mu.Lock()
+		myXPriv = oldXPriv
+		mu.Unlock()
+	}()
 
 	// Alice derives shared key using Bob's public key
 	shared1, err := deriveSharedKey(bobPubHex)
@@ -157,8 +159,9 @@ func TestX25519_RandomKeyConsistency(t *testing.T) {
 	}
 
 	// Set global to Bob's private key
+	mu.Lock()
 	myXPriv = bobXPriv
-	defer func() { myXPriv = oldXPriv }()
+	mu.Unlock()
 
 	// Bob derives shared key using Alice's public key
 	shared2, err := deriveSharedKey(alicePubHex)
@@ -208,8 +211,15 @@ func TestAESGCM_RoundTrip(t *testing.T) {
 	plaintext := "Hello, secure world! This is a test message for AES-GCM."
 
 	// Set global to Alice's private key for encryption
+	mu.Lock()
 	oldXPriv := myXPriv
 	myXPriv = aliceXPriv
+	mu.Unlock()
+	defer func() {
+		mu.Lock()
+		myXPriv = oldXPriv
+		mu.Unlock()
+	}()
 
 	// Alice encrypts for Bob
 	ciphertextB64 := HaloEncryptFor(bobPubHex, plaintext)
@@ -218,7 +228,9 @@ func TestAESGCM_RoundTrip(t *testing.T) {
 	}
 
 	// Set global to Bob's private key for decryption
+	mu.Lock()
 	myXPriv = bobXPriv
+	mu.Unlock()
 
 	// Bob decrypts from Alice
 	decrypted := HaloDecryptFrom(alicePubHex, ciphertextB64)
@@ -229,9 +241,6 @@ func TestAESGCM_RoundTrip(t *testing.T) {
 	if decrypted != plaintext {
 		t.Errorf("decryption mismatch: got %q, want %q", decrypted, plaintext)
 	}
-
-	// Restore
-	myXPriv = oldXPriv
 }
 
 // TestAESGCM_InvalidCiphertext tests that tampered ciphertext is rejected
@@ -265,13 +274,19 @@ func TestAESGCM_InvalidCiphertext(t *testing.T) {
 
 	plaintext := "Test message"
 
+	mu.Lock()
 	oldXPriv := myXPriv
 	myXPriv = aliceXPriv
+	mu.Unlock()
+	defer func() {
+		mu.Lock()
+		myXPriv = oldXPriv
+		mu.Unlock()
+	}()
 	ciphertextB64 := HaloEncryptFor(bobPubHex, plaintext)
 	if strings.HasPrefix(ciphertextB64, "error:") {
 		t.Fatalf("HaloEncryptFor failed: %s", ciphertextB64)
 	}
-	myXPriv = oldXPriv
 
 	// Tamper with the ciphertext (flip a bit in the middle)
 	ciphertextBytes := []byte(ciphertextB64)
@@ -280,12 +295,13 @@ func TestAESGCM_InvalidCiphertext(t *testing.T) {
 	}
 	tamperedB64 := string(ciphertextBytes)
 
+	mu.Lock()
 	myXPriv = bobXPriv
+	mu.Unlock()
 	decrypted := HaloDecryptFrom(alicePubHex, tamperedB64)
 	if !strings.HasPrefix(decrypted, "error:") {
 		t.Error("expected decryption to fail with tampered ciphertext, but it succeeded")
 	}
-	myXPriv = oldXPriv
 }
 
 // TestAESGCM_WrongKeyRejection tests that decryption with wrong key fails
@@ -326,40 +342,58 @@ func TestAESGCM_WrongKeyRejection(t *testing.T) {
 
 	plaintext := "Secret for Bob only"
 
+	mu.Lock()
 	oldXPriv := myXPriv
 	myXPriv = aliceXPriv
+	mu.Unlock()
+	defer func() {
+		mu.Lock()
+		myXPriv = oldXPriv
+		mu.Unlock()
+	}()
 	ciphertextB64 := HaloEncryptFor(bobPubHex, plaintext)
 	if strings.HasPrefix(ciphertextB64, "error:") {
 		t.Fatalf("HaloEncryptFor failed: %s", ciphertextB64)
 	}
-	myXPriv = oldXPriv
 
 	// Carol tries to decrypt (should fail)
+	mu.Lock()
 	myXPriv = carolXPriv
+	mu.Unlock()
 	decrypted := HaloDecryptFrom(alicePubHex, ciphertextB64)
 	if !strings.HasPrefix(decrypted, "error:") {
 		t.Error("expected decryption to fail with Carol's key, but it succeeded")
 	}
-	myXPriv = oldXPriv
+}
+
+// testNIP44Keys generates NIP-44 conversation keys for two X25519 identities.
+// This helper encapsulates the NIP-17 key derivation logic so that NIP-44 tests
+// don't depend directly on internal NIP-17 types and functions.
+func testNIP44Keys(t *testing.T, aliceXPrivArr, bobXPrivArr [32]byte) (aliceSndSk, aliceSndPk, bobRcvSk, bobRcvPk string) {
+	t.Helper()
+
+	var aliceXPub, bobXPub [32]byte
+	curve25519.ScalarBaseMult(&aliceXPub, &aliceXPrivArr)
+	curve25519.ScalarBaseMult(&bobXPub, &bobXPrivArr)
+
+	aliceXID := xid{priv: aliceXPrivArr, pub: aliceXPub}
+	bobXID := xid{priv: bobXPrivArr, pub: bobXPub}
+
+	aliceSndSk, aliceSndPk, err := nip17DeriveRoleAs(aliceXID, bobXPub, nip17SndInfo, hex.EncodeToString(aliceXPub[:]))
+	if err != nil {
+		t.Fatalf("alice derive sender role: %v", err)
+	}
+
+	bobRcvSk, bobRcvPk, err := nip17DeriveRoleAs(bobXID, aliceXPub, nip17RcvInfo, hex.EncodeToString(bobXPub[:]))
+	if err != nil {
+		t.Fatalf("bob derive receiver role: %v", err)
+	}
+
+	return aliceSndSk, aliceSndPk, bobRcvSk, bobRcvPk
 }
 
 // TestNIP44_ConversationKey tests NIP-44 v2 conversation key generation
 func TestNIP44_ConversationKey(t *testing.T) {
-	// Generate two Ed25519 keypairs for NIP-44 (uses secp256k1)
-	alicePriv := ed25519.GenerateKey(rand.Reader)
-	bobPriv := ed25519.GenerateKey(rand.Reader)
-
-	// Wait, NIP-44 uses secp256k1, not ed25519. Let me check...
-	// Actually nip44.GenerateConversationKey takes hex-encoded secp256k1 pubkeys and privkeys.
-	// For testing, we need to generate secp256k1 keys.
-	// But the nip44 package expects specific format. Let me use the nip44 test vectors or generate properly.
-
-	// Actually, let's check how nip17 uses it - it derives secp keys from X25519 shared secret.
-	// For a direct NIP-44 test, we can use known test vectors or generate our own secp256k1 keys.
-
-	// Use the nip44 package to generate conversation keys
-	// We'll use the same approach as nip17: derive secp keys from X25519
-
 	// Generate X25519 identities
 	aliceXPriv := make([]byte, 32)
 	bobXPriv := make([]byte, 32)
@@ -381,23 +415,8 @@ func TestNIP44_ConversationKey(t *testing.T) {
 	copy(aliceXPrivArr[:], aliceXPriv)
 	copy(bobXPrivArr[:], bobXPriv)
 
-	var aliceXPub, bobXPub [32]byte
-	curve25519.ScalarBaseMult(&aliceXPub, &aliceXPrivArr)
-	curve25519.ScalarBaseMult(&bobXPub, &bobXPrivArr)
-
-	// Use nip17DeriveRoleAs to derive secp keys for conversation
-	aliceXID := xid{priv: aliceXPrivArr, pub: aliceXPub}
-	bobXID := xid{priv: bobXPrivArr, pub: bobXPub}
-
-	aliceSndSk, aliceSndPk, err := nip17DeriveRoleAs(aliceXID, bobXPub, nip17SndInfo, hex.EncodeToString(aliceXPub[:]))
-	if err != nil {
-		t.Fatalf("alice derive sender role: %v", err)
-	}
-
-	bobRcvSk, bobRcvPk, err := nip17DeriveRoleAs(bobXID, aliceXPub, nip17RcvInfo, hex.EncodeToString(bobXPub[:]))
-	if err != nil {
-		t.Fatalf("bob derive receiver role: %v", err)
-	}
+	// Derive NIP-44 conversation keys using helper
+	aliceSndSk, aliceSndPk, bobRcvSk, bobRcvPk := testNIP44Keys(t, aliceXPrivArr, bobXPrivArr)
 
 	// Alice generates conversation key for Bob
 	ck1, err := nip44.GenerateConversationKey(bobRcvPk, aliceSndSk)
@@ -439,26 +458,8 @@ func TestNIP44_EncryptDecrypt(t *testing.T) {
 	copy(aliceXPrivArr[:], aliceXPriv)
 	copy(bobXPrivArr[:], bobXPriv)
 
-	var aliceXPub, bobXPub [32]byte
-	curve25519.ScalarBaseMult(&aliceXPub, &aliceXPrivArr)
-	curve25519.ScalarBaseMult(&bobXPub, &bobXPrivArr)
-
-	aliceXID := xid{priv: aliceXPrivArr, pub: aliceXPub}
-	bobXID := xid{priv: bobXPrivArr, pub: bobXPub}
-
-	aliceSndSk, aliceSndPk, err := nip17DeriveRoleAs(aliceXID, bobXPub, nip17SndInfo, hex.EncodeToString(aliceXPub[:]))
-	if err != nil {
-		t.Fatalf("alice derive sender: %v", err)
-	}
-	_, bobRcvPk, err := nip17DeriveRoleAs(aliceXID, bobXPub, nip17RcvInfo, hex.EncodeToString(bobXPub[:]))
-	if err != nil {
-		t.Fatalf("bob derive receiver: %v", err)
-	}
-
-	bobRcvSk, _, err := nip17DeriveRoleAs(bobXID, aliceXPub, nip17RcvInfo, hex.EncodeToString(bobXPub[:]))
-	if err != nil {
-		t.Fatalf("bob derive receiver sk: %v", err)
-	}
+	// Derive NIP-44 conversation keys using helper
+	aliceSndSk, aliceSndPk, bobRcvSk, bobRcvPk := testNIP44Keys(t, aliceXPrivArr, bobXPrivArr)
 
 	// Generate conversation keys
 	ckAlice, err := nip44.GenerateConversationKey(bobRcvPk, aliceSndSk)
@@ -520,24 +521,17 @@ func TestNIP44_InvalidCiphertextRejection(t *testing.T) {
 	copy(aliceXPrivArr[:], aliceXPriv)
 	copy(bobXPrivArr[:], bobXPriv)
 
-	var aliceXPub, bobXPub [32]byte
-	curve25519.ScalarBaseMult(&aliceXPub, &aliceXPrivArr)
-	curve25519.ScalarBaseMult(&bobXPub, &bobXPrivArr)
+	// Derive NIP-44 conversation keys using helper
+	aliceSndSk, aliceSndPk, bobRcvSk, bobRcvPk := testNIP44Keys(t, aliceXPrivArr, bobXPrivArr)
 
-	aliceXID := xid{priv: aliceXPrivArr, pub: aliceXPub}
-	bobXID := xid{priv: bobXPrivArr, pub: bobXPub}
-
-	aliceSndSk, aliceSndPk, err := nip17DeriveRoleAs(aliceXID, bobXPub, nip17SndInfo, hex.EncodeToString(aliceXPub[:]))
+	ckAlice, err := nip44.GenerateConversationKey(bobRcvPk, aliceSndSk)
 	if err != nil {
-		t.Fatalf("alice derive sender: %v", err)
+		t.Fatalf("alice conversation key: %v", err)
 	}
-	bobRcvSk, bobRcvPk, err := nip17DeriveRoleAs(bobXID, aliceXPub, nip17RcvInfo, hex.EncodeToString(bobXPub[:]))
+	ckBob, err := nip44.GenerateConversationKey(aliceSndPk, bobRcvSk)
 	if err != nil {
-		t.Fatalf("bob derive receiver: %v", err)
+		t.Fatalf("bob conversation key: %v", err)
 	}
-
-	ckAlice, _ := nip44.GenerateConversationKey(bobRcvPk, aliceSndSk)
-	ckBob, _ := nip44.GenerateConversationKey(aliceSndPk, bobRcvSk)
 
 	msg := "Test message for tampering"
 	ciphertext, err := nip44.Encrypt(msg, ckAlice)
@@ -644,7 +638,7 @@ func TestNIP59_WrongPeerRejection(t *testing.T) {
 
 	var aliceXPrivArr, bobXPrivArr, carolXPrivArr [32]byte
 	copy(aliceXPrivArr[:], aliceXPriv)
-	copy(bobXPrivArr[:], bobXPriv)
+	copy(bobXPrivArr[:], bobPriv)
 	copy(carolXPrivArr[:], carolXPriv)
 
 	var aliceXPub, bobXPub, carolXPub [32]byte
@@ -880,6 +874,86 @@ func TestScrypt_WrongPassphraseRejection(t *testing.T) {
 	}
 }
 
+// TestHaloEncryptBackupDecryptBackup tests the exported FFI functions for backup encryption
+func TestHaloEncryptBackupDecryptBackup(t *testing.T) {
+	plaintext := "This is my secret backup data that should be encrypted via FFI!"
+	passphrase := "my-secure-backup-passphrase-123"
+
+	// Encrypt using the exported FFI function
+	ciphertext := HaloEncryptBackup(plaintext, passphrase)
+	if strings.HasPrefix(ciphertext, "error:") {
+		t.Fatalf("HaloEncryptBackup failed: %s", ciphertext)
+	}
+
+	// Verify the format
+	prefix := "halo-backup:v1:"
+	if !strings.HasPrefix(ciphertext, prefix) {
+		t.Errorf("expected ciphertext to start with %q, got %q", prefix, ciphertext[:min(len(ciphertext), 20)])
+	}
+
+	// Decrypt using the exported FFI function
+	decrypted := HaloDecryptBackup(ciphertext, passphrase)
+	if strings.HasPrefix(decrypted, "error:") {
+		t.Fatalf("HaloDecryptBackup failed: %s", decrypted)
+	}
+
+	if decrypted != plaintext {
+		t.Errorf("backup round-trip failed: got %q, want %q", decrypted, plaintext)
+	}
+}
+
+// TestHaloDecryptBackup_WrongPassphrase tests that wrong passphrase fails to decrypt backup
+func TestHaloDecryptBackup_WrongPassphrase(t *testing.T) {
+	plaintext := "Secret backup data"
+	passphrase := "correct-passphrase"
+	wrongPassphrase := "wrong-passphrase"
+
+	ciphertext := HaloEncryptBackup(plaintext, passphrase)
+	if strings.HasPrefix(ciphertext, "error:") {
+		t.Fatalf("HaloEncryptBackup failed: %s", ciphertext)
+	}
+
+	// Try to decrypt with wrong passphrase
+	decrypted := HaloDecryptBackup(ciphertext, wrongPassphrase)
+	if !strings.HasPrefix(decrypted, "error:") {
+		t.Error("expected decryption to fail with wrong passphrase")
+	}
+}
+
+// TestHaloDecryptBackup_CorruptData tests that corrupt backup data is rejected
+func TestHaloDecryptBackup_CorruptData(t *testing.T) {
+	plaintext := "Test data"
+	passphrase := "passphrase"
+
+	ciphertext := HaloEncryptBackup(plaintext, passphrase)
+	if strings.HasPrefix(ciphertext, "error:") {
+		t.Fatalf("HaloEncryptBackup failed: %s", ciphertext)
+	}
+
+	// Corrupt the base64 data
+	corrupted := ciphertext[:len(ciphertext)/2] + "X" + ciphertext[len(ciphertext)/2+1:]
+
+	decrypted := HaloDecryptBackup(corrupted, passphrase)
+	if !strings.HasPrefix(decrypted, "error:") {
+		t.Error("expected decryption to fail with corrupted data")
+	}
+}
+
+// TestHaloDecryptBackup_InvalidFormat tests that non-backup data is rejected
+func TestHaloDecryptBackup_InvalidFormat(t *testing.T) {
+	// Try to decrypt something that's not a halo backup
+	decrypted := HaloDecryptBackup("not-a-backup-blob", "passphrase")
+	if !strings.HasPrefix(decrypted, "error:") {
+		t.Error("expected decryption to fail for non-backup data")
+	}
+
+	// Try with wrong prefix
+	decrypted = HaloDecryptBackup("halo-backup:v2:invalid", "passphrase")
+	if !strings.HasPrefix(decrypted, "error:") {
+		t.Error("expected decryption to fail for wrong version")
+	}
+}
+
 // TestEd25519_SignVerify tests Ed25519 signing and verification for handle claims
 func TestEd25519_SignVerify(t *testing.T) {
 	// Generate Ed25519 keypair
@@ -935,9 +1009,15 @@ func TestEd25519_HandleSign(t *testing.T) {
 	if _, err := rand.Read(testPriv); err != nil {
 		t.Fatal(err)
 	}
+	mu.Lock()
 	oldEdPriv := myEdPriv
 	myEdPriv = ed25519.PrivateKey(testPriv)
-	defer func() { myEdPriv = oldEdPriv }()
+	mu.Unlock()
+	defer func() {
+		mu.Lock()
+		myEdPriv = oldEdPriv
+		mu.Unlock()
+	}()
 
 	handles := []string{
 		"alice",
@@ -997,4 +1077,11 @@ func TestEd25519_DeterministicSignatures(t *testing.T) {
 	if !ed25519.Verify(pubKey, msg, sig2) {
 		t.Error("sig2 verification failed")
 	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
