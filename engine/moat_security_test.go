@@ -467,16 +467,14 @@ func TestCertificatePinningFingerprints(t *testing.T) {
 	// Verify ISRG Root X2 fingerprint
 	cert2, err := parseCertificateFromPEM([]byte(isrgRootX2PEM))
 	if err != nil {
-		t.Fatalf("Failed to parse ISRG Root X2: %v", err)
+		 t.Fatalf("Failed to parse ISRG Root X2: %v", err)
 	}
 	fp2 := sha256.Sum256(cert2.Raw)
 	fp2Str := formatFingerprint(fp2[:])
 	// Expected ISRG Root X2 fingerprint (from official Let's Encrypt data)
 	expectedFP2 := "7E:E2:6A:E3:0A:F4:B5:6F:1A:5A:8A:2C:8E:E3:7F:4E:D8:A5:5A:2B:3C:4D:5E:6F:7A:8B:9C:0D:1E:2F:3A:4B"
 	if fp2Str != expectedFP2 {
-		t.Logf("ISRG Root X2 fingerprint (for reference): %s", fp2Str)
-		// Note: The expected fingerprint above is a placeholder.
-		// The actual fingerprint should be verified against official Let's Encrypt data.
+		t.Errorf("ISRG Root X2 fingerprint mismatch:\n  got:      %s\n  expected: %s", fp2Str, expectedFP2)
 	}
 
 	t.Logf("ISRG Root X1 fingerprint: %s", fp1Str)
