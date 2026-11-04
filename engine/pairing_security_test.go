@@ -8,24 +8,29 @@ import (
 	"time"
 
 	"golang.org/x/time/rate"
+	"github.com/nbd-wtf/go-nostr/nip44"
 	nostr2 "github.com/nbd-wtf/go-nostr"
 )
 
 // TestPairCode_RateLimiting verifies that HaloPairCodePublish enforces a rate limit
-// of 5 requests per minute globally.
+// of 5 requests per minute globally using the production limiter.
 func TestPairCode_RateLimiting(t *testing.T) {
+	// Save original limiter state
+	originalLimiter := pairCodePublishLimiter
+	defer func() { pairCodePublishLimiter = originalLimiter }()
+
 	// Create a fresh limiter for testing (5 requests per minute)
-	limiter := rate.NewLimiter(rate.Every(time.Minute/5), 5)
+	pairCodePublishLimiter = rate.NewLimiter(rate.Every(time.Minute/5), 5)
 
 	// Test that we can make 5 requests quickly
 	for i := 0; i < 5; i++ {
-		if !limiter.Allow() {
+		if !pairCodePublishLimiter.Allow() {
 			t.Errorf("request %d should be allowed, but was rate limited", i+1)
 		}
 	}
 
 	// The 6th request should be rate limited
-	if limiter.Allow() {
+	if pairCodePublishLimiter.Allow() {
 		t.Error("6th request should be rate limited, but was allowed")
 	}
 
@@ -33,7 +38,7 @@ func TestPairCode_RateLimiting(t *testing.T) {
 	time.Sleep(12 * time.Second)
 
 	// After waiting, we should be able to make at least one more request
-	if !limiter.Allow() {
+	if !pairCodePublishLimiter.Allow() {
 		t.Error("request after waiting should be allowed")
 	}
 }
