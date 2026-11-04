@@ -22,11 +22,15 @@ import (
 	"github.com/mailru/easyjson"
 	nostr2 "github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip44"
+	"golang.org/x/time/rate"
 )
 
 import "C"
 
 const pairCodeInfo = "kryfo-paircode-v1:"
+
+// Global rate limiter for pair code publishing: 5 requests per minute
+var pairCodePublishLimiter = rate.NewLimiter(rate.Every(time.Minute/5), 5)
 
 // the code alone decides the keypair, so both phones land on the same one
 // without having exchanged anything first.
@@ -55,6 +59,11 @@ func pairCodeKeys(code string) (sk, pk string, err error) {
 //
 //export HaloPairCodePublish
 func HaloPairCodePublish(cCode, cPayload *C.char) *C.char {
+	// Rate limiting: 5 requests per minute globally
+	if !pairCodePublishLimiter.Allow() {
+		return C.CString("error: rate limited")
+	}
+
 	code := C.GoString(cCode)
 	payload := C.GoString(cPayload)
 
