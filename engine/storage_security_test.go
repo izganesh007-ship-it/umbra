@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package main
 
+/*
+#cgo CFLAGS: -I.
+#include <stdlib.h>
+*/
+import "C"
+
 import (
 	"bytes"
 	"crypto/rand"
